@@ -77,6 +77,7 @@ test:
   save_gt_image: false
   save_input_images: false
   save_depth: false
+  using_refinement: false
   save_depth_npy: false
   save_depth_concat_img: false
   save_gaussian: false

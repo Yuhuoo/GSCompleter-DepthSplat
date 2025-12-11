@@ -46,8 +46,8 @@ def get_projection_matrix(
 def render_cuda(
     extrinsics: Float[Tensor, "batch 4 4"],
     intrinsics: Float[Tensor, "batch 3 3"],
-    near: Float[Tensor, " batch"],
-    far: Float[Tensor, " batch"],
+    near: Float[Tensor, "batch"],
+    far: Float[Tensor, "batch"],
     image_shape: tuple[int, int],
     background_color: Float[Tensor, "batch 3"],
     gaussian_means: Float[Tensor, "batch gaussian 3"],
@@ -56,7 +56,7 @@ def render_cuda(
     gaussian_opacities: Float[Tensor, "batch gaussian"],
     scale_invariant: bool = True,
     use_sh: bool = True,
-) -> Float[Tensor, "batch 3 height width"]:
+) -> tuple[Float[Tensor, "batch 3 height width"], Float[Tensor, "batch 1 height width"], Float[Tensor, "batch 1 height width"]]:
     assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
 
     # Make sure everything is in a range where numerical issues don't appear.
@@ -87,6 +87,8 @@ def render_cuda(
 
     all_images = []
     all_radii = []
+    all_alpha_mask = []
+    all_depth_map = []
     for i in range(b):
         # Set up a tensor for the gradients of the screen-space means.
         mean_gradients = torch.zeros_like(gaussian_means[i], requires_grad=True)
@@ -113,7 +115,7 @@ def render_cuda(
 
         row, col = torch.triu_indices(3, 3)
 
-        image, radii = rasterizer(
+        image, feature_map, alpha_mask, depth_map, radii = rasterizer(
             means3D=gaussian_means[i],
             means2D=mean_gradients,
             shs=shs[i] if use_sh else None,
@@ -123,7 +125,9 @@ def render_cuda(
         )
         all_images.append(image)
         all_radii.append(radii)
-    return torch.stack(all_images)
+        all_alpha_mask.append(alpha_mask)
+        all_depth_map.append(depth_map)
+    return torch.stack(all_images), torch.stack(all_alpha_mask), torch.stack(all_depth_map)
 
 
 def render_cuda_orthographic(
@@ -221,44 +225,3 @@ def render_cuda_orthographic(
 
 DepthRenderingMode = Literal["depth", "disparity", "relative_disparity", "log"]
 
-
-def render_depth_cuda(
-    extrinsics: Float[Tensor, "batch 4 4"],
-    intrinsics: Float[Tensor, "batch 3 3"],
-    near: Float[Tensor, " batch"],
-    far: Float[Tensor, " batch"],
-    image_shape: tuple[int, int],
-    gaussian_means: Float[Tensor, "batch gaussian 3"],
-    gaussian_covariances: Float[Tensor, "batch gaussian 3 3"],
-    gaussian_opacities: Float[Tensor, "batch gaussian"],
-    scale_invariant: bool = True,
-    mode: DepthRenderingMode = "depth",
-) -> Float[Tensor, "batch height width"]:
-    # Specify colors according to Gaussian depths.
-    camera_space_gaussians = einsum(
-        extrinsics.inverse(), homogenize_points(gaussian_means), "b i j, b g j -> b g i"
-    )
-    fake_color = camera_space_gaussians[..., 2]
-
-    if mode == "disparity":
-        fake_color = 1 / fake_color
-    elif mode == "log":
-        fake_color = fake_color.minimum(near[:, None]).maximum(far[:, None]).log()
-
-    # Render using depth as color.
-    b, _ = fake_color.shape
-    result = render_cuda(
-        extrinsics,
-        intrinsics,
-        near,
-        far,
-        image_shape,
-        torch.zeros((b, 3), dtype=fake_color.dtype, device=fake_color.device),
-        gaussian_means,
-        gaussian_covariances,
-        repeat(fake_color, "b g -> b g c ()", c=3),
-        gaussian_opacities,
-        scale_invariant=scale_invariant,
-        use_sh=False,
-    )
-    return result.mean(dim=1)

@@ -78,9 +78,16 @@ class MultiViewUniMatch(nn.Module):
 
         # monodepth
         encoder = vit_type  # can also be 'vitb' or 'vitl'
-        self.pretrained = torch.hub.load(
-            "facebookresearch/dinov2", "dinov2_{:}14".format(encoder)
-        )
+        # self.pretrained = torch.hub.load(
+        #     "facebookresearch/dinov2", "dinov2_{:}14".format(encoder), source='local'
+        # )
+        self.pretrained = torch.hub.load('dinov2-main', "dinov2_{:}14".format(encoder), source='local', pretrained=False)
+        model_path = "./pretrained/dinov2_vitb14_pretrain.pth"
+        try:
+            state_dict = torch.load(model_path, map_location='cpu')
+            self.pretrained.load_state_dict(state_dict)
+        except Exception as e:
+            self.pretrained = torch.hub.load("facebookresearch/dinov2", "dinov2_{:}14".format(encoder))
 
         del self.pretrained.mask_token  # unused
 

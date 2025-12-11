@@ -2,9 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
-import moviepy.editor as mpy
 import torch
-import wandb
 from einops import pack, rearrange, repeat, einsum
 from jaxtyping import Float
 from pytorch_lightning import LightningModule
@@ -68,6 +66,7 @@ class TestCfg:
     save_gt_image: bool
     save_input_images: bool
     save_depth: bool
+    using_refinement: bool
     save_depth_concat_img: bool
     save_depth_npy: bool
     save_gaussian: bool
@@ -166,63 +165,15 @@ class ModelWrapper(LightningModule):
             pred_depths = gaussians["depths"]
             gaussians = gaussians["gaussians"]
 
-        supervise_intermediate_depth = False
-
-        if gaussians.means.size(0) != batch["target"]["extrinsics"].size(0):
-            supervise_intermediate_depth = True
-            assert gaussians.means.size(0) % batch["target"]["extrinsics"].size(0) == 0
-            num_depths = gaussians.means.size(0) // batch["target"]["extrinsics"].size(
-                0
-            )
-            # add loss to intermediate depth predictions
-            target_extrinsics = torch.cat(
-                [batch["target"]["extrinsics"]] * num_depths, dim=0
-            )
-            target_intrinsics = torch.cat(
-                [batch["target"]["intrinsics"]] * num_depths, dim=0
-            )
-            target_near = torch.cat([batch["target"]["near"]] * num_depths, dim=0)
-            target_far = torch.cat([batch["target"]["far"]] * num_depths, dim=0)
-
-            output_all = self.decoder.forward(
-                gaussians,
-                target_extrinsics,
-                target_intrinsics,
-                target_near,
-                target_far,
-                (h, w),
-                depth_mode=self.train_cfg.depth_mode,
-            )
-            # split
-            batch_size = batch["target"]["extrinsics"].size(0)
-            # order: intermediate depth, final depth
-            output_intermediate = DecoderOutput(
-                color=output_all.color[:-batch_size],
-                depth=(
-                    output_all.depth[:-batch_size]
-                    if output_all.depth is not None
-                    else None
-                ),
-            )
-            output = DecoderOutput(
-                color=output_all.color[-batch_size:],
-                depth=(
-                    output_all.depth[-batch_size:]
-                    if output_all.depth is not None
-                    else None
-                ),
-            )
-
-        else:
-            output = self.decoder.forward(
-                gaussians,
-                batch["target"]["extrinsics"],
-                batch["target"]["intrinsics"],
-                batch["target"]["near"],
-                batch["target"]["far"],
-                (h, w),
-                depth_mode=self.train_cfg.depth_mode,
-            )
+        output = self.decoder.forward(
+            gaussians,
+            batch["target"]["extrinsics"],
+            batch["target"]["intrinsics"],
+            batch["target"]["near"],
+            batch["target"]["far"],
+            (h, w),
+            depth_mode=self.train_cfg.depth_mode,
+        )
 
         target_gt = batch["target"]["image"]
 
@@ -260,76 +211,6 @@ class ModelWrapper(LightningModule):
             self.log(f"loss/{loss_fn.name}", loss)
             total_loss = total_loss + loss
 
-        # color loss on intermediate output
-        if supervise_intermediate_depth:
-            for loss_fn in self.losses:
-                if output_intermediate.color.size(0) != batch_size:
-                    assert output_intermediate.color.size(0) % batch_size == 0
-                    num_intermediate = output_intermediate.color.size(0) // batch_size
-                    intermediate_loss = 0
-                    for i in range(num_intermediate):
-                        curr_output = DecoderOutput(
-                            color=output_intermediate.color[
-                                (batch_size * i) : (batch_size * (i + 1))
-                            ],
-                            depth=(
-                                output_intermediate.depth[
-                                    (batch_size * i) : (batch_size * (i + 1))
-                                ]
-                                if output_intermediate.depth is not None
-                                else None
-                            ),
-                        )
-                        curr_loss_weight = self.train_cfg.intermediate_loss_weight ** (
-                            num_intermediate - i
-                        )
-
-                        if loss_fn.name == "mse":
-                            loss = loss_fn.forward(
-                                curr_output,
-                                batch,
-                                gaussians,
-                                self.global_step,
-                                l1_loss=self.train_cfg.l1_loss,
-                                clamp_large_error=self.train_cfg.train_ignore_large_loss,
-                                valid_depth_mask=valid_depth_mask,
-                            )
-                        else:
-                            loss = loss_fn.forward(
-                                curr_output,
-                                batch,
-                                gaussians,
-                                self.global_step,
-                                valid_depth_mask=valid_depth_mask,
-                            )
-
-                        intermediate_loss = intermediate_loss + curr_loss_weight * loss
-
-                    self.log(f"loss/{loss_fn.name}_intermediate", intermediate_loss)
-                    total_loss = total_loss + intermediate_loss
-                else:
-                    if loss_fn.name == "mse":
-                        loss = loss_fn.forward(
-                            output_intermediate,
-                            batch,
-                            gaussians,
-                            self.global_step,
-                            l1_loss=self.train_cfg.l1_loss,
-                            clamp_large_error=self.train_cfg.train_ignore_large_loss,
-                            valid_depth_mask=valid_depth_mask,
-                        )
-                    else:
-                        loss = loss_fn.forward(
-                            output_intermediate,
-                            batch,
-                            gaussians,
-                            self.global_step,
-                            valid_depth_mask=valid_depth_mask,
-                        )
-                    self.log(f"loss/{loss_fn.name}_intermediate", loss)
-                    total_loss = (
-                        total_loss + self.train_cfg.intermediate_loss_weight * loss
-                    )
 
         self.log("loss/total", total_loss)
 
@@ -363,6 +244,10 @@ class ModelWrapper(LightningModule):
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
 
+        # [DEBUG]
+        if batch['scene'][0] != "0bfdd020cf475b9c68e4b469d1d1a2d0cad303eefe8b78fb2307855afdaac8be":
+            return
+
         pred_depths = None
 
         # save input views for visualization
@@ -375,6 +260,18 @@ class ModelWrapper(LightningModule):
             index = batch["context"]["index"][0]
             for idx, color in zip(index, input_images):
                 save_image(color, path / "images" / scene / f"color/input_{idx:0>6}.png")
+
+        if self.test_cfg.using_refinement:
+            extra_context = {
+                "extrinsics": batch["target"]["extrinsics"], # [1, V, 4, 4]
+                "intrinsics": batch["target"]["intrinsics"], # [1, V, 3, 3]
+                "image": batch["target"]["image"],           # [1, V, 3, H, W]
+                "near": batch["target"]["near"],             # [1, V]
+                "far": batch["target"]["far"],               # [1, V]
+                "index": batch["target"]["index"]            # [1, V]
+            }
+        else:
+            extra_context = None
 
         # save depth vis
         if self.test_cfg.save_depth or self.test_cfg.save_gaussian:
@@ -389,6 +286,9 @@ class ModelWrapper(LightningModule):
                 self.global_step,
                 deterministic=False,
                 visualization_dump=visualization_dump,
+                extra_context=extra_context,
+                scene_names=batch['scene'],
+                decoder=self.decoder.forward,
             )
 
             if isinstance(gaussians, dict):
@@ -687,11 +587,10 @@ class ModelWrapper(LightningModule):
                 (concat_img.cpu().detach(), depth_viz), dim=1
             )  # [3, H*2, W*N]
 
-            self.logger.log_image(
-                "depth",
+            self.log_image(
+                "depth", 
                 [concat],
-                step=self.global_step,
-                caption=batch["scene"],
+                self.global_step,
             )
 
         if not self.train_cfg.forward_depth_only:
@@ -701,11 +600,10 @@ class ModelWrapper(LightningModule):
                 add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
                 add_label(vcat(*rgb_softmax), "Target (Prediction)"),
             )
-            self.logger.log_image(
+            self.log_image(
                 "comparison",
                 [prep_image(add_border(comparison))],
-                step=self.global_step,
-                caption=batch["scene"],
+                self.global_step,
             )
 
             if not self.train_cfg.no_log_projections:
@@ -717,23 +615,29 @@ class ModelWrapper(LightningModule):
                         extra_label="(Prediction)",
                     )[0]
                 )
-                self.logger.log_image(
+                self.log_image(
                     "projection",
                     [prep_image(add_border(projections))],
-                    step=self.global_step,
+                    self.global_step,
                 )
 
                 # Draw cameras.
                 cameras = hcat(*render_cameras(batch, 256))
-                self.logger.log_image(
-                    "cameras", [prep_image(add_border(cameras))], step=self.global_step
+                self.log_image(
+                    "cameras", 
+                    [prep_image(add_border(cameras))],
+                    self.global_step,
                 )
 
             if self.encoder_visualizer is not None:
                 for k, image in self.encoder_visualizer.visualize(
                     batch["context"], self.global_step
                 ).items():
-                    self.logger.log_image(k, [prep_image(image)], step=self.global_step)
+                    self.log_image(
+                        k, 
+                        [prep_image(image)],
+                        self.global_step,
+                    )
 
             # Run video validation step.
             if not self.train_cfg.no_viz_video:
@@ -744,8 +648,8 @@ class ModelWrapper(LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         """hack to run the full validation"""
-        if self.trainer.sanity_checking and self.global_rank == 0:
-            print(self.encoder)  # log the model to wandb log files
+        # if self.trainer.sanity_checking and self.global_rank == 0:
+        #     print(self.encoder)  # log the model to wandb log files
 
         if (not self.trainer.sanity_checking) and (self.eval_data_cfg is not None):
             self.eval_cnt = self.eval_cnt + 1
@@ -1050,26 +954,37 @@ class ModelWrapper(LightningModule):
         ]
 
         video = torch.stack(images)
-        video = (video.clip(min=0, max=1) * 255).type(torch.uint8).cpu().numpy()
-        if loop_reverse:
-            video = pack([video, video[::-1][1:-1]], "* c h w")[0]
-        visualizations = {
-            f"video/{name}": wandb.Video(video[None], fps=30, format="mp4")
-        }
-
-        # Since the PyTorch Lightning doesn't support video logging, log to wandb directly.
-        try:
-            wandb.log(visualizations)
-        except Exception:
-            assert isinstance(self.logger, LocalLogger)
-            for key, value in visualizations.items():
-                tensor = value._prepare_video(value.data)
-                clip = mpy.ImageSequenceClip(list(tensor), fps=value._fps)
-                dir = LOG_PATH / key
-                dir.mkdir(exist_ok=True, parents=True)
-                clip.write_videofile(
-                    str(dir / f"{self.global_step:0>6}.mp4"), logger=None
-                )
+        video = (video.clip(min=0, max=1) * 255).type(torch.uint8).cpu()
+        if loop_reverse and len(video) > 1:
+            # 确保有足够的帧进行反转操作
+            reversed_video = video.flip(0)  # 等同于 video[::-1] 但更安全
+            if len(video) > 2:
+                # 只有当视频有多于2帧时才去掉首尾帧
+                reversed_video = reversed_video[1:-1]
+            video = torch.cat([video, reversed_video], dim=0)
+        
+        # 转换为TensorBoard格式
+        # 调整维度顺序为 (T, C, H, W) -> (N, T, C, H, W)
+        video_tensor = video.unsqueeze(0)  # 添加批次维度
+        
+        # 使用TensorBoard的SummaryWriter记录视频
+        if hasattr(self, 'logger') and hasattr(self.logger, 'experiment'):
+            self.logger.experiment.add_video(
+                f"video/{name}",
+                video_tensor,
+                global_step=self.global_step,
+                fps=30
+            )
+        else:
+            # 创建SummaryWriter
+            writer = SummaryWriter(log_dir=LOG_PATH)
+            writer.add_video(
+                f"video/{name}",
+                video_tensor,
+                global_step=self.global_step,
+                fps=30
+            )
+            writer.close()
 
     def configure_optimizers(self):
         if self.optimizer_cfg.lr_monodepth > 0:
@@ -1126,3 +1041,33 @@ class ModelWrapper(LightningModule):
                 "frequency": 1,
             },
         }
+        
+    def log_image(self, tag, image, caption=None):
+        # 处理图像列表（取第一个元素）
+        if isinstance(image, list) and len(image) > 0:
+            image = image[0]
+        
+        # 转换图像为张量
+        if isinstance(image, Image.Image):
+            image_tensor = F.to_tensor(image)
+        elif isinstance(image, np.ndarray):
+            if image.ndim == 3 and image.shape[2] == 3:
+                image_tensor = torch.from_numpy(image).permute(2, 0, 1).float()
+            else:
+                image_tensor = torch.from_numpy(image).float()
+        else:
+            image_tensor = image
+        
+        # 确保值范围在 0-1 之间
+        if image_tensor.max() > 1.0:
+            image_tensor = image_tensor / 255.0
+        
+        # 记录到日志器
+        if hasattr(self.logger, 'experiment') and hasattr(self.logger.experiment, 'add_image'):
+            # TensorBoard 记录
+            self.logger.experiment.add_image(
+                tag, 
+                image_tensor, 
+                self.global_step,
+                dataformats='CHW'
+            )

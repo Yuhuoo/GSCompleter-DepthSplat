@@ -168,3 +168,5 @@ output
 checkpoints
 assets
 experiments
+dinov2-main
+difix3d

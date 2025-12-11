@@ -1,10 +1,14 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Literal, Optional, List
+import copy
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import optim
 from einops import rearrange
-from jaxtyping import Float
-from torch import Tensor, nn
+import numpy as np
+from scipy.spatial.transform import Rotation
 
 from ...dataset.shims.patch_shim import apply_patch_shim
 from ...dataset.types import BatchedExample, DataShim
@@ -13,13 +17,8 @@ from ..types import Gaussians
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg
 from .encoder import Encoder
 from .visualization.encoder_visualizer_depthsplat_cfg import EncoderVisualizerDepthSplatCfg
-
-import torchvision.transforms as T
-import torch.nn.functional as F
-
 from .unimatch.mv_unimatch import MultiViewUniMatch
 from .unimatch.dpt_head import DPTHead
-
 
 @dataclass
 class EncoderDepthSplatCfg:
@@ -137,17 +136,20 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         nn.init.zeros_(self.gaussian_head[-1].weight[3:6])
         nn.init.zeros_(self.gaussian_head[-1].bias[3:6])
 
-    def forward(
+    def predict(
         self,
         context: dict,
         global_step: int,
         deterministic: bool = False,
         visualization_dump: Optional[dict] = None,
         scene_names: Optional[list] = None,
+        output_view_idx: int = None
     ):
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
-
+        
+        # [B, V, C, H, W]
+        
         if v > 3:
             with torch.no_grad():
                 xyzs = context["extrinsics"][:, :, :3, -1].detach()
@@ -169,57 +171,25 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             nn_matrix=cameras_dist_index,
         )
 
-        # list of [B, V, H, W], with all the intermediate depths
         depth_preds = results_dict['depth_preds']
+        depth = depth_preds[-1] # [B, V, H, W]
 
-        # [B, V, H, W]
-        depth = depth_preds[-1]
-
+        # === Early Return for Depth Only Training ===
         if self.cfg.train_depth_only:
-            # convert format
-            # [B, V, H*W, 1, 1]
             depths = rearrange(depth, "b v h w -> b v (h w) () ()")
+            depths = rearrange(depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w).squeeze(-1).squeeze(-1)
+            return {"gaussians": None, "depths": depths}
 
-            if self.cfg.supervise_intermediate_depth and len(depth_preds) > 1:
-                # supervise all the intermediate depth predictions
-                num_depths = len(depth_preds)
-
-                # [B, V, H*W, 1, 1]
-                intermediate_depths = torch.cat(
-                    depth_preds[:(num_depths - 1)], dim=0)
-                intermediate_depths = rearrange(
-                    intermediate_depths, "b v h w -> b v (h w) () ()")
-
-                # concat in the batch dim
-                depths = torch.cat((intermediate_depths, depths), dim=0)
-
-                b *= num_depths
-
-            # return depth prediction for supervision
-            depths = rearrange(
-                depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w
-            ).squeeze(-1).squeeze(-1)
-            # print(depths.shape)  # [B, V, H, W]
-
-            return {
-                "gaussians": None,
-                "depths": depths
-            }
-
-        # features [BV, C, H, W]
+        # features
         features = self.feature_upsampler(results_dict["features_mono_intermediate"],
                                           cnn_features=results_dict["features_cnn_all_scales"][::-1],
                                           mv_features=results_dict["features_mv"][
                                           0] if self.cfg.num_scales == 1 else results_dict["features_mv"][::-1]
                                           )
 
-        # match prob from softmax
-        # [BV, D, H, W] in feature resolution
         match_prob = results_dict['match_probs'][-1]
-        match_prob = torch.max(match_prob, dim=1, keepdim=True)[
-            0]  # [BV, 1, H, W]
-        match_prob = F.interpolate(
-            match_prob, size=depth.shape[-2:], mode='nearest')
+        match_prob = torch.max(match_prob, dim=1, keepdim=True)[0]
+        match_prob = F.interpolate(match_prob, size=depth.shape[-2:], mode='nearest')
 
         # unet input
         concat = torch.cat((
@@ -231,161 +201,76 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
 
         out = self.gaussian_regressor(concat)
 
-        concat = [out,
-                    rearrange(context["image"],
-                            "b v c h w -> (b v) c h w"),
-                    features,
-                    match_prob]
-
+        concat = [out, rearrange(context["image"], "b v c h w -> (b v) c h w"), features, match_prob]
         out = torch.cat(concat, dim=1)
 
-        gaussians = self.gaussian_head(out)  # [BV, C, H, W]
-
+        gaussians = self.gaussian_head(out)  
+        # [BV, C, H, W] -> [B, V, C, H, W]
         gaussians = rearrange(gaussians, "(b v) c h w -> b v c h w", b=b, v=v)
-
+        
+        # Prepare adapter input
         depths = rearrange(depth, "b v h w -> b v (h w) () ()")
-
-        # [B, V, H*W, 1, 1]
-        densities = rearrange(
-            match_prob, "(b v) c h w -> b v (c h w) () ()", b=b, v=v)
-        # [B, V, H*W, 84]
-        raw_gaussians = rearrange(
-            gaussians, "b v c h w -> b v (h w) c")
-
-        if self.cfg.supervise_intermediate_depth and len(depth_preds) > 1:
-
-            # supervise all the intermediate depth predictions
-            num_depths = len(depth_preds)
-
-            # [B, V, H*W, 1, 1]
-            intermediate_depths = torch.cat(
-                depth_preds[:(num_depths - 1)], dim=0)
-            
-            intermediate_depths = rearrange(
-                intermediate_depths, "b v h w -> b v (h w) () ()")
-
-            # concat in the batch dim
-            depths = torch.cat((intermediate_depths, depths), dim=0)
-
-            # shared color head
-            densities = torch.cat([densities] * num_depths, dim=0)
-            raw_gaussians = torch.cat(
-                [raw_gaussians] * num_depths, dim=0)
-
-            b *= num_depths
-
-        # [B, V, H*W, 1, 1]
+        raw_gaussians = rearrange(gaussians, "b v c h w -> b v (h w) c")
         opacities = raw_gaussians[..., :1].sigmoid().unsqueeze(-1)
         raw_gaussians = raw_gaussians[..., 1:]
         
-        # Convert the features and depths into Gaussians.
         xy_ray, _ = sample_image_grid((h, w), device)
         xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")
-        gaussians = rearrange(
-            raw_gaussians,
-            "... (srf c) -> ... srf c",
-            srf=self.cfg.num_surfaces,
-        )
-        offset_xy = gaussians[..., :2].sigmoid()
-        pixel_size = 1 / \
-            torch.tensor((w, h), dtype=torch.float32, device=device)
+        gaussians_reshaped = rearrange(raw_gaussians, "... (srf c) -> ... srf c", srf=self.cfg.num_surfaces)
+        offset_xy = gaussians_reshaped[..., :2].sigmoid()
+        pixel_size = 1 / torch.tensor((w, h), dtype=torch.float32, device=device)
         xy_ray = xy_ray + (offset_xy - 0.5) * pixel_size
 
         sh_input_images = context["image"]
 
-        if self.cfg.supervise_intermediate_depth and len(depth_preds) > 1:
-            context_extrinsics = torch.cat(
-                [context["extrinsics"]] * len(depth_preds), dim=0)
-            context_intrinsics = torch.cat(
-                [context["intrinsics"]] * len(depth_preds), dim=0)
-
-            gaussians = self.gaussian_adapter.forward(
-                rearrange(context_extrinsics, "b v i j -> b v () () () i j"),
-                rearrange(context_intrinsics, "b v i j -> b v () () () i j"),
-                rearrange(xy_ray, "b v r srf xy -> b v r srf () xy"),
-                depths,
-                opacities,
-                rearrange(
-                    gaussians[..., 2:],
-                    "b v r srf c -> b v r srf () c",
-                ),
-                (h, w),
-                input_images=sh_input_images.repeat(
-                    len(depth_preds), 1, 1, 1, 1) if self.cfg.init_sh_input_img else None,
-            )
-
-        else:
-            gaussians = self.gaussian_adapter.forward(
-                rearrange(context["extrinsics"],
-                          "b v i j -> b v () () () i j"),
-                rearrange(context["intrinsics"],
-                          "b v i j -> b v () () () i j"),
-                rearrange(xy_ray, "b v r srf xy -> b v r srf () xy"),
-                depths,
-                opacities,
-                rearrange(
-                    gaussians[..., 2:],
-                    "b v r srf c -> b v r srf () c",
-                ),
-                (h, w),
-                input_images=sh_input_images if self.cfg.init_sh_input_img else None,
-            )
-
-        # Dump visualizations if needed.
-        if visualization_dump is not None:
-            visualization_dump["depth"] = rearrange(
-                depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w
-            )
-            visualization_dump["scales"] = rearrange(
-                gaussians.scales, "b v r srf spp xyz -> b (v r srf spp) xyz"
-            )
-            visualization_dump["rotations"] = rearrange(
-                gaussians.rotations, "b v r srf spp xyzw -> b (v r srf spp) xyzw"
-            )
-
-        gaussians = Gaussians(
-            rearrange(
-                gaussians.means,
-                "b v r srf spp xyz -> b (v r srf spp) xyz",
-            ),
-            rearrange(
-                gaussians.covariances,
-                "b v r srf spp i j -> b (v r srf spp) i j",
-            ),
-            rearrange(
-                gaussians.harmonics,
-                "b v r srf spp c d_sh -> b (v r srf spp) c d_sh",
-            ),
-            rearrange(
-                gaussians.opacities,
-                "b v r srf spp -> b (v r srf spp)",
-            ),
+        # Gaussian Adapter Forward -> Returns tensors with shape [B, V, N, C]
+        gaussians_phys = self.gaussian_adapter.forward(
+            rearrange(context["extrinsics"], "b v i j -> b v () () () i j"),
+            rearrange(context["intrinsics"], "b v i j -> b v () () () i j"),
+            rearrange(xy_ray, "b v r srf xy -> b v r srf () xy"),
+            depths,
+            opacities,
+            rearrange(gaussians_reshaped[..., 2:], "b v r srf c -> b v r srf () c"),
+            (h, w),
+            input_images=sh_input_images if self.cfg.init_sh_input_img else None,
         )
 
+        if visualization_dump is not None:
+            visualization_dump["depth"] = rearrange(depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w)
+
+        def get_tensor(name):
+            val = getattr(gaussians_phys, name)
+            if output_view_idx is not None:
+                # [B, 1, N, C]
+                val = val[:, output_view_idx:output_view_idx+1]
+            return val
+
+        # === Flatten Batch and View dimensions ===
+        # Input: [B, V, N, C] -> Output: [B*V, N, C]
+        gaussians_separated = Gaussians(
+            rearrange(get_tensor('means'), "b v r srf spp xyz -> (b v) (r srf spp) xyz"),
+            rearrange(get_tensor('covariances'), "b v r srf spp i j -> (b v) (r srf spp) i j"),
+            rearrange(get_tensor('harmonics'), "b v r srf spp c d_sh -> (b v) (r srf spp) c d_sh"),
+            rearrange(get_tensor('opacities'), "b v r srf spp -> (b v) (r srf spp)"),
+            rearrange(get_tensor('scales'), "b v r srf spp xyz -> (b v) (r srf spp) xyz"),
+            rearrange(get_tensor('rotations'), "b v r srf spp xyzw -> (b v) (r srf spp) xyzw"),
+        )
+        
+        depths_ret = rearrange(depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w).squeeze(-1).squeeze(-1)
+        
+        return {"gaussians": gaussians_separated, "depths": depths_ret}
+
+    def forward(self, context, global_step, deterministic=False, visualization_dump=None, scene_names=None, **kwargs):
+        # Clean forward, just calls predict
+        res = self.predict(context, global_step, deterministic, visualization_dump, scene_names)
         if self.cfg.return_depth:
-            # return depth prediction for supervision
-            depths = rearrange(
-                depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w
-            ).squeeze(-1).squeeze(-1)
-            # print(depths.shape)  # [B, V, H, W]
-
-            return {
-                "gaussians": gaussians,
-                "depths": depths
-            }
-
-        return gaussians
+            return res
+        return res["gaussians"]
 
     def get_data_shim(self) -> DataShim:
         def data_shim(batch: BatchedExample) -> BatchedExample:
-            batch = apply_patch_shim(
-                batch,
-                patch_size=self.cfg.shim_patch_size
-                * self.cfg.downscale_factor,
-            )
-
+            batch = apply_patch_shim(batch, patch_size=self.cfg.shim_patch_size * self.cfg.downscale_factor)
             return batch
-
         return data_shim
 
     @property
