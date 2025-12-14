@@ -21,127 +21,88 @@ import torch.nn as nn
 import numpy as np
 
 class GeometricEvaluator:
-    def __init__(self, device, scene_scale_unit=1.0):
-        """
-        scene_scale_unit: 场景的尺度单位估算。
-        如果你的场景是归一化的([-1, 1])，保持 1.0。
-        如果你的场景是米制的，且物体很大，可以适当调整。
-        """
+    def __init__(self, device):
         self.device = device
-        self.scale = scene_scale_unit
 
     def filter_outliers_by_box(self, pred_pts, gt_pts, margin=0.1):
-        """
-        根据 GT 的包围盒过滤 Pred 中的离群点 (Floaters)。
-        这能有效避免远处的飘浮噪点拉爆 Chamfer Distance。
-        """
         if pred_pts.shape[0] == 0 or gt_pts.shape[0] == 0:
             return pred_pts
-
-        # 计算 GT 的 AABB 包围盒
         gt_min = gt_pts.min(dim=0)[0]
         gt_max = gt_pts.max(dim=0)[0]
-        
-        # 加上一点余量 (margin)
         span = gt_max - gt_min
         box_min = gt_min - span * margin
         box_max = gt_max + span * margin
-        
-        # 过滤
         in_box_mask = (pred_pts >= box_min) & (pred_pts <= box_max)
         in_box_mask = in_box_mask.all(dim=1)
-        
         filtered_pred = pred_pts[in_box_mask]
-        
-        # 如果过滤太狠导致没点了，就回退到原始点云（或者是保留最近的K个点，这里简化处理）
         if filtered_pred.shape[0] < 100:
-            # print("  [Eval Warning] Outlier filtering removed too many points. Falling back.")
             return pred_pts
-            
         return filtered_pred
 
     def robust_chamfer_distance(self, p1, p2):
         """
-        计算鲁棒的 Chamfer Distance (L1/Euclidean).
         p1: Prediction [N, 3]
         p2: Ground Truth [M, 3]
         """
-        # 1. 降采样 (防止 OOM)
         N_max = 5000
         if p1.shape[0] > N_max: p1 = p1[torch.randperm(p1.shape[0])[:N_max]]
         if p2.shape[0] > N_max: p2 = p2[torch.randperm(p2.shape[0])[:N_max]]
         
-        # 2. 使用 torch.cdist 计算欧氏距离矩阵 (L2 norm matrix)
-        # cdist 内部由 C++ 优化，比手写 (x-y)^2 快
-        # p1: [N, 3], p2: [M, 3] -> dists: [N, M]
+        # 计算距离矩阵 (Euclidean)
         dists = torch.cdist(p1, p2, p=2) 
         
-        # 3. 找最近邻
-        # min_dist_pred: 每个预测点距离最近 GT 点的距离
         min_dist_pred, _ = torch.min(dists, dim=1) 
-        # min_dist_gt: 每个 GT 点距离最近预测点的距离
         min_dist_gt, _ = torch.min(dists, dim=0)
         
-        # 4. 计算 Chamfer (L1 Mean)
-        # 这里返回的是真实的距离单位，不再是平方
         chamfer_dist = torch.mean(min_dist_pred) + torch.mean(min_dist_gt)
         
-        # 5. F-Score Calculation
-        # 阈值设定为场景尺度的 5% 或固定值
-        # 假设场景是归一化的，0.05 是个常用的严格阈值
-        threshold = 0.05 * self.scale
+        # [改进 2] 动态计算 F-Score 阈值
+        # 策略：计算 GT 点云的包围盒对角线长度，取其 1% 或 5% 作为阈值
+        # 这能适应任何尺度的场景 (无论是 1.0 还是 100.0)
+        gt_span = p2.max(dim=0)[0] - p2.min(dim=0)[0]
+        scene_scale = torch.norm(gt_span).item() # 对角线长度
+        
+        # 常用标准：Scene Scale 的 1% (严格) 或 5% (宽松)
+        # 鉴于 Unimatch 是稠密预测，我们用 2% 作为一个中肯标准
+        threshold = 0.01 * scene_scale 
         
         precision = (min_dist_pred < threshold).float().mean()
         recall = (min_dist_gt < threshold).float().mean()
         f_score = 2 * precision * recall / (precision + recall + 1e-8)
         
-        return chamfer_dist.item(), f_score.item()
+        # 返回 Threshold 方便 debug
+        return chamfer_dist.item(), f_score.item(), threshold
 
     def evaluate(self, step_name, pred_depth, gt_depth, pred_means, gt_means, valid_mask):
-        """
-        Evaluate Depth and Geometry.
-        """
         metrics = {}
         
-        # --- 1. Depth Metrics (2D) ---
-        # 过滤掉无效区域 (GT <= 0)
-        valid_mask = valid_mask & (gt_depth > 1e-4) & (pred_depth > 1e-4)
+        # --- 2D Metrics ---
+        # 增加极小值保护，防止 AbsRel 算除法时爆炸
+        valid_mask = valid_mask & (gt_depth > 1e-3) & (pred_depth > 1e-3)
         
         p = pred_depth[valid_mask]
         g = gt_depth[valid_mask]
         
-        if len(p) > 100: # 确保有足够的点计算统计量
-            # AbsRel: |pred - gt| / gt
+        if len(p) > 100:
             abs_rel = (torch.abs(p - g) / g).mean().item()
-            
-            # Delta Accuracy
             thresh = torch.max((g / p), (p / g))
             acc_125 = (thresh < 1.25).float().mean().item()
-            
-            # SILog (Scale Invariant Logarithmic Error)
-            err = torch.log(p) - torch.log(g)
-            silog = torch.sqrt((err ** 2).mean() - (err.mean()) ** 2).item() * 100
-            
             metrics['AbsRel'] = abs_rel
             metrics['Acc1.25'] = acc_125
-            metrics['SILog'] = silog
         else:
-            metrics['AbsRel'] = 1.0 # 默认坏值
+            metrics['AbsRel'] = 1.0
             metrics['Acc1.25'] = 0.0
-            metrics['SILog'] = 100.0
 
-        # --- 2. Point Cloud Metrics (3D) ---
-        # [关键改进] 先过滤掉那些离谱的浮空噪点
+        # --- 3D Metrics ---
         clean_pred_means = self.filter_outliers_by_box(pred_means, gt_means)
         
-        cd, f_score = self.robust_chamfer_distance(clean_pred_means, gt_means)
+        # 获取 metrics 和 动态计算的 threshold
+        cd, f_score, adaptive_thresh = self.robust_chamfer_distance(clean_pred_means, gt_means)
         metrics['Chamfer'] = cd
         metrics['F-Score'] = f_score
 
-        # 打印日志 (格式化得更紧凑一点)
-        # 如果是归一化场景，CD 应该在 0.0x ~ 0.5 之间
         print(f"  [EVAL @ {step_name}] AbsRel: {metrics['AbsRel']:.3f} | Acc1.25: {metrics['Acc1.25']:.3f} | "
-              f"CD(L1): {metrics['Chamfer']:.4f} | F-Score: {metrics['F-Score']:.3f}")
+              f"CD: {metrics['Chamfer']:.3f} | F-Score(@{adaptive_thresh:.2f}): {metrics['F-Score']:.3f}")
         
         return metrics
 
@@ -253,7 +214,7 @@ class GaussianTTOOptimizer(nn.Module):
                  lr_scale_s2=0.001,
                  lr_rot_s2=0.001,
                  max_scale=0.015,
-                 context_view_sample_k=4  # [新增] 每次迭代随机采样的视角数量
+                 context_view_sample_k=4
                  ):
         super().__init__()
         self.steps_stage1 = steps_stage1
@@ -272,72 +233,30 @@ class GaussianTTOOptimizer(nn.Module):
                 context_gaussians: Gaussians, 
                 context_render_pkg: dict,
                 target_render_pkg: dict,
-                hole_tags: torch.Tensor = None): 
+                hole_tags: torch.Tensor = None,
+                stereo_anchor_idx: int = None): # [新增参数]
         
         device = target_gaussians.means.device
         
-        # ==============================================================================
-        # 准备评测工具和真值 (Ground Truth Preparation)
-        # ==============================================================================
+        # ... (Evaluator 和 GT 准备代码，保持不变) ...
         evaluator = GeometricEvaluator(device)
-
-        # 渲染 Context 到 Target 视角，获取“几何真值深度”
         with torch.no_grad():
             flat_context_gaussians = self.flatten_gaussians(context_gaussians)
-            gt_render_out = decoder(
-                context_gaussians, # 注意：这里用的是 Context Gaussians
-                target_render_pkg['extrinsics'], 
-                target_render_pkg['intrinsics'], 
-                target_render_pkg['near'], 
-                target_render_pkg['far'], 
-                (target_render_pkg['h'], target_render_pkg['w']), 
-                depth_mode="depth"
-            )
-            # 这是真正的几何 GT (来自已建图部分)
+            gt_render_out = decoder(context_gaussians, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], target_render_pkg['near'], target_render_pkg['far'], (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
             gt_scene_depth = gt_render_out.depth[0].squeeze(1) 
-            gt_valid_mask = gt_render_out.alpha[0].squeeze(0) > 0.5 # 只评测有旧场景覆盖的地方
-            
-            # 提取 GT 点云 (简单起见，直接采样 Context Gaussians 的中心点，或者反投影深度)
-            # 为了更精确，这里简单的使用 Context Gaussians 的 Means
-            # 如果 Context 点太多，Evaluator 内部会自动降采样
+            gt_valid_mask = gt_render_out.alpha[0].squeeze(0) > 0.5 
             gt_scene_means = context_gaussians.means.squeeze(0)
 
-        # 定义一个内部辅助函数来方便调用
         def run_eval(step_label, current_gaussians):
             with torch.no_grad():
-                # 1. 渲染当前 Target Gaussians 的深度
-                curr_out = decoder(
-                    current_gaussians,
-                    target_render_pkg['extrinsics'], 
-                    target_render_pkg['intrinsics'], 
-                    target_render_pkg['near'], 
-                    target_render_pkg['far'], 
-                    (target_render_pkg['h'], target_render_pkg['w']), 
-                    depth_mode="depth"
-                )
-                curr_depth = curr_out.depth[0].squeeze(1)
-                
-                # 2. 获取当前点云中心
-                curr_means = current_gaussians.means.squeeze(0)
-                
-                # 3. 评测
-                evaluator.evaluate(
-                    step_label, 
-                    curr_depth, gt_scene_depth, 
-                    curr_means, gt_scene_means, 
-                    gt_valid_mask
-                )
+                curr_out = decoder(current_gaussians, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], target_render_pkg['near'], target_render_pkg['far'], (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
+                evaluator.evaluate(step_label, curr_out.depth[0].squeeze(1), gt_scene_depth, current_gaussians.means.squeeze(0), gt_scene_means, gt_valid_mask)
 
-        # ==============================================================================
-        # [EVAL] 1. Before Stage 1 (Initial Prediction)
-        # ==============================================================================
-        # 此时的 target_gaussians 是 Encoder 直接预测出来的，可能尺度不对
         run_eval("Pre-Stage1 (Raw Encoder)", target_gaussians)
 
         # --------------------------------------------------------------------------
-        # 准备 Stage 1 变量 (保持不变)
+        # 准备 Stage 1 变量
         # --------------------------------------------------------------------------
-
         with torch.no_grad():
             target_c2w = target_render_pkg['extrinsics'][0, 0].to(device)
             cam_center = target_c2w[:3, 3]
@@ -364,12 +283,30 @@ class GaussianTTOOptimizer(nn.Module):
             if opt_harmonics.dim() == 4: opt_harmonics = opt_harmonics.squeeze(0)
             opt_harmonics.requires_grad_(False)
 
+            # [新增] 准备 Stereo Anchor 数据
+            anchor_gt_depth = None
+            anchor_valid_mask = None
+            anchor_extrinsics = None
+            anchor_intrinsics = None
+            anchor_near = None
+            anchor_far = None
+            
+            if stereo_anchor_idx is not None:
+                print(f"  [TTO Stage 1] Enabling Stereo Reprojection Loss (Anchor: {stereo_anchor_idx})")
+                anchor_gt_depth = context_render_pkg['depth'][:, stereo_anchor_idx].to(device) # [1, H, W]
+                anchor_extrinsics = context_render_pkg['extrinsics'][:, stereo_anchor_idx:stereo_anchor_idx+1]
+                anchor_intrinsics = context_render_pkg['intrinsics'][:, stereo_anchor_idx:stereo_anchor_idx+1]
+                anchor_near = context_render_pkg['near'][:, stereo_anchor_idx:stereo_anchor_idx+1]
+                anchor_far = context_render_pkg['far'][:, stereo_anchor_idx:stereo_anchor_idx+1]
+                anchor_valid_mask = anchor_gt_depth > 1e-4
+
         # --------------------------------------------------------------------------
-        # STAGE 1: Geometric Surface Alignment (保持不变)
+        # STAGE 1: Geometric Surface Alignment
         # --------------------------------------------------------------------------
         print("  [TTO] Stage 1 (Merged Ray-Depth Optimization)...")
         
         with torch.no_grad():
+            # 初始化距离
             aligned_z_depth = target_render_pkg['depth'].view(-1).to(device)
             view_dir = c2w_rot[:, 2] 
             cos_theta = (ray_dirs * view_dir).sum(dim=-1)
@@ -387,35 +324,68 @@ class GaussianTTOOptimizer(nn.Module):
         with torch.enable_grad():
             for step in range(self.steps_stage1):
                 optimizer_s1.zero_grad()
+                
+                # 1. 沿射线移动点
                 curr_means = cam_center + opt_dists * ray_dirs
                 curr_target_gaussians = self._build_gaussians(curr_means, opt_log_scales, opt_rotations, opt_opacities, opt_harmonics, c2w_rot)
+                
+                # 2. 与 Context 合并 (为了渲染遮挡关系，虽然 Stage1 主要看 Target)
                 merged_gaussians = self.merge_gaussians_for_render(flat_context_gaussians, curr_target_gaussians)
+                
+                # --- Loss A: Target View Depth (Monocular/Aligned) ---
                 render_out = decoder(merged_gaussians, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], target_render_pkg['near'], target_render_pkg['far'], (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
                 
                 loss_depth = (torch.abs(render_out.depth.squeeze(1) - gt_sparse_depth) * gt_mask).sum() / (gt_mask.sum() + 1e-6)
-                loss = 1.0 * loss_depth + 0.1 * l1_loss(render_out.color[0], gt_image[0])
-                loss.backward()
+                loss_rgb = l1_loss(render_out.color[0], gt_image[0])
+                
+                total_loss = 1.0 * loss_depth + 0.1 * loss_rgb
+                
+                # --- Loss B: [NEW] Stereo Reprojection Loss (Geometric Constraint) ---
+                if stereo_anchor_idx is not None:
+                    # 只渲染 Target Gaussians 到 Anchor 视角
+                    # 这样可以得到纯粹由 Target 生成的几何
+                    stereo_out = decoder(
+                        curr_target_gaussians, 
+                        anchor_extrinsics, anchor_intrinsics, anchor_near, anchor_far,
+                        (target_render_pkg['h'], target_render_pkg['w']), 
+                        depth_mode="depth"
+                    )
+                    stereo_depth = stereo_out.depth[0]
+                    stereo_alpha = stereo_out.alpha[0]
+                    
+                    # 只在 Target 投影有效 且 Anchor GT 有效 的区域计算
+                    # Alpha > 0.5 意味着这个高斯球确实“占据”了 Anchor 的像素
+                    valid_stereo_mask = (stereo_alpha > 0.5) & anchor_valid_mask
+                    
+                    if valid_stereo_mask.sum() > 100:
+                        loss_stereo = torch.abs(stereo_depth - anchor_gt_depth)
+                        loss_stereo = (loss_stereo * valid_stereo_mask).sum() / (valid_stereo_mask.sum() + 1e-6)
+                        
+                        # 强约束！
+                        total_loss += 1.0 * loss_stereo
+                        
+                        # [Debug log]
+                        if step % 20 == 0:
+                            print(f"    Step {step} | Stereo Loss: {loss_stereo.item():.4f}")
+
+                total_loss.backward()
                 optimizer_s1.step()
+                
+                # 约束：距离不能为负
                 with torch.no_grad(): opt_dists.data = torch.clamp(opt_dists.data, min=0.1)
 
         # --------------------------------------------------------------------------
-        # Filtering (保持不变)
+        # Filtering
         # --------------------------------------------------------------------------
         print("  [TTO] Filtering by Hole Tags...")
         with torch.no_grad():
             final_means_s1 = cam_center + opt_dists.detach() * ray_dirs 
             target_gaussians.means = final_means_s1.unsqueeze(0).detach()
-
-            # ==============================================================================
-            # [EVAL] 2. After Stage 1 (Aligned)
-            # ==============================================================================
-            # 此时几何应该已经被 align_depth_median 拉回了正确的尺度
-            run_eval("Post-Stage1 (Depth Aligned)", target_gaussians)
             
-            if hole_tags is not None:
-                keep_mask = hole_tags.to(device)
-            else:
-                keep_mask = torch.ones(final_means_s1.shape[0], dtype=torch.bool, device=device)
+            run_eval("Post-Stage1 (Stereo Optimized)", target_gaussians)
+
+            if hole_tags is not None: keep_mask = hole_tags.to(device)
+            else: keep_mask = torch.ones(final_means_s1.shape[0], dtype=torch.bool, device=device)
             
             print(f"  [Filter] Points before: {len(final_means_s1)} -> after: {keep_mask.sum()}")
             if keep_mask.sum() == 0: return target_gaussians
@@ -427,7 +397,7 @@ class GaussianTTOOptimizer(nn.Module):
             valid_harmonics = opt_harmonics[keep_mask]
 
         # --------------------------------------------------------------------------
-        # STAGE 2: Refinement (修改：随机采样 K 个 Context 视角)
+        # STAGE 2: Refinement (随机采样 K 个 Context 视角)
         # --------------------------------------------------------------------------
         print("  [TTO] Stage 2 (Unified RGB Refinement - Random K Views)...")
         
@@ -449,38 +419,25 @@ class GaussianTTOOptimizer(nn.Module):
         with torch.enable_grad():
             for step in range(self.steps_stage2):
                 optimizer_s2.zero_grad()
-                
                 with torch.no_grad():
                     opt_log_scales.data = torch.clamp(opt_log_scales.data, max=torch.log(torch.tensor(self.max_scale, device=device)))
 
-                # 1. 构建 & 合并
                 curr_tgt_gaussians = self._build_gaussians(opt_means, opt_log_scales, opt_rotations, opt_opacities, opt_harmonics, c2w_rot)
                 merged_gaussians = self.merge_gaussians_for_render(flat_context_gaussians, curr_tgt_gaussians)
 
                 total_loss = 0.0
                 views_count = 0
-
-                # --- A. Target View (当前视角必须参与) ---
-                tgt_out = decoder(
-                    merged_gaussians, 
-                    target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], 
-                    target_render_pkg['near'], target_render_pkg['far'], 
-                    (target_render_pkg['h'], target_render_pkg['w']), depth_mode=None
-                )
+                
+                # --- A. Target View RGB ---
+                tgt_out = decoder(merged_gaussians, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], target_render_pkg['near'], target_render_pkg['far'], (target_render_pkg['h'], target_render_pkg['w']), depth_mode=None)
                 total_loss += l1_loss(tgt_out.color[0], gt_image[0])
                 views_count += 1
 
-                # --- B. Context Views (随机采样 K 个) ---
+                # --- B. Context Views RGB (Random K) ---
                 if num_ctx_views > 0:
-                    # 确定要采样的数量
                     K = self.context_view_sample_k
-                    
-                    if num_ctx_views <= K:
-                        # 如果总视角少于 K，全选
-                        selected_indices = torch.arange(num_ctx_views, device=device)
-                    else:
-                        # 否则随机选 K 个不重复的
-                        selected_indices = torch.randperm(num_ctx_views, device=device)[:K]
+                    if num_ctx_views <= K: selected_indices = torch.arange(num_ctx_views, device=device)
+                    else: selected_indices = torch.randperm(num_ctx_views, device=device)[:K]
                     
                     for v_idx in selected_indices:
                         ctx_extrinsics = context_render_pkg['extrinsics'][:, v_idx : v_idx+1]
@@ -489,12 +446,7 @@ class GaussianTTOOptimizer(nn.Module):
                         ctx_far = context_render_pkg['far'][:, v_idx : v_idx+1]
                         ctx_image_gt = context_render_pkg['image'][:, v_idx]
                         
-                        ctx_out = decoder(
-                            merged_gaussians, 
-                            ctx_extrinsics, ctx_intrinsics, ctx_near, ctx_far, 
-                            (context_render_pkg['h'], context_render_pkg['w']), 
-                            depth_mode=None
-                        )
+                        ctx_out = decoder(merged_gaussians, ctx_extrinsics, ctx_intrinsics, ctx_near, ctx_far, (context_render_pkg['h'], context_render_pkg['w']), depth_mode=None)
                         total_loss += l1_loss(ctx_out.color[0], ctx_image_gt[0])
                         views_count += 1
                 
@@ -533,7 +485,6 @@ class GaussianTTOOptimizer(nn.Module):
 
         return target_gaussians
 
-    # ... (_build_gaussians, merge_gaussians_for_render, flatten_gaussians 保持不变) ...
     def _build_gaussians(self, means, log_scales, rotations, opacities, harmonics, c2w_rot):
         if means.dim() == 3: means_sq = means.squeeze(0)
         else: means_sq = means
@@ -658,7 +609,14 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                     tgt_out = decoder(flat_context_gaussians, extra_context["extrinsics"][:, i:i+1], extra_context["intrinsics"][:, i:i+1], extra_context["near"][:, i:i+1], extra_context["far"][:, i:i+1], (h, w), depth_mode="depth")
                     tgt_rendered_rgb = tgt_out.color[0]
                     tgt_opacity_mask = tgt_out.alpha[0]
-                    tgt_valid_mask = tgt_opacity_mask > 0.8 
+                    tgt_valid_mask = tgt_opacity_mask > 0.5
+
+                    coverage_ratio = (tgt_opacity_mask > 0.99).float().mean().item()
+                    should_pass = coverage_ratio < 0.1
+                    if should_pass:
+                        print(f"This view is optimized well, should pass, view {i}")
+                        continue
+
                     tgt_sparse_depth = tgt_out.depth[0] * tgt_valid_mask.float()
                     tgt_hole_mask = ~tgt_valid_mask
 
@@ -726,6 +684,10 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                 # [DEBUG] Visualization
                 dense_depth_vis = visualize_depth(aligned_dense_depth, cmap_name='Spectral')
                 save_image(dense_depth_vis, os.path.join(debug_dir, f"view_{i}_02_dense_depth.png"))
+                mask_vis = tgt_valid_mask.float().cpu().squeeze()  # [H, W]
+                if mask_vis.dim() == 2:
+                    mask_vis = mask_vis.unsqueeze(0).repeat(3, 1, 1) # [3, H, W]
+                save_image(mask_vis, os.path.join(debug_dir, f"view_{i}_03_align_mask.png"))
                 # # ---------------------------------------------------------------------
 
                 # # ---------------- align using target ---------------------------------
@@ -805,7 +767,8 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                         context_gaussians=flat_context_gaussians, 
                         context_render_pkg=context_render_pkg, 
                         target_render_pkg=target_render_pkg,
-                        hole_tags=hole_tags
+                        hole_tags=hole_tags,
+                        stereo_anchor_idx=stereo_anchor_idx
                     )
                     # 3. 收集结果
                     final_output_list.append(self._clone_gaussians_data(refined_target_gaussians))
