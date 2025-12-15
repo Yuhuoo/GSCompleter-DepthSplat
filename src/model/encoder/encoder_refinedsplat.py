@@ -1,6 +1,7 @@
+import os
+import sys
 from dataclasses import dataclass, fields
 from typing import Literal, Optional, List
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,9 +17,6 @@ from ...misc.image_io import save_image
 
 from .common.gaussians import build_covariance
 
-import torch
-import torch.nn as nn
-import numpy as np
 
 class GeometricEvaluator:
     def __init__(self, device):
@@ -530,11 +528,16 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
         self.rotation_weight = 1.0
         self.translation_weight = 1.0
         
-        # 1. Load DiFix
-        print("Loading DiFix Pipeline...")
-        from src.model.encoder.difix3d.pipeline_difix import DifixPipeline
-        self.difix = DifixPipeline.from_pretrained("nvidia/difix_ref", trust_remote_code=True, low_cpu_mem_usage=False)
-        self.difix.set_progress_bar_config(disable=True)
+        # 1. Using Positional-Encoding Field
+        print("Loading PE Pipeline (from ~/code/pe_field)...")
+        external_pe_root = os.path.expanduser("~/code")
+        if external_pe_root not in sys.path:
+            sys.path.insert(0, external_pe_root)
+            
+        import pe_field
+        from pe_field.pipeline_pe_field import PEFieldPipeline
+        # 初始化 PE-Field Pipeline
+        self.pe_field = PEFieldPipeline()
 
         # 2. Init TTO Optimizer
         self.tto_optimizer = GaussianTTOOptimizer()
@@ -583,10 +586,6 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
             scene_name = scene_names[0][:-len('/nerfstudio')] if scene_names else "scene"
             debug_dir = os.path.join(output_dir, "debug", scene_name)
             os.makedirs(debug_dir, exist_ok=True)
-            
-            device = context["image"].device
-            if self.difix.device != device:
-                self.difix.to(device)
 
             context_render_pkg = {
                 "extrinsics": context["extrinsics"],
@@ -604,31 +603,51 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                 print(f"--- Processing Target View {i} ---")
                 print(f"Fixing Image Using Anchor: {difix_anchor_idx} ")
 
-                # Step A & B (Render & DiFix)
+                # Step A: Check Coverage (Render current Gaussians)
                 with torch.no_grad():
                     tgt_out = decoder(flat_context_gaussians, extra_context["extrinsics"][:, i:i+1], extra_context["intrinsics"][:, i:i+1], extra_context["near"][:, i:i+1], extra_context["far"][:, i:i+1], (h, w), depth_mode="depth")
                     tgt_rendered_rgb = tgt_out.color[0]
                     tgt_opacity_mask = tgt_out.alpha[0]
                     tgt_valid_mask = tgt_opacity_mask > 0.5
 
-                    coverage_ratio = (tgt_opacity_mask > 0.99).float().mean().item()
-                    should_pass = coverage_ratio < 0.1
-                    if should_pass:
-                        print(f"This view is optimized well, should pass, view {i}")
-                        continue
+                    # coverage_ratio = (tgt_opacity_mask > 0.99).float().mean().item()
+                    # should_pass = coverage_ratio < 0.1
+                    # if should_pass:
+                    #     print(f"Coverage {coverage_ratio:.3f} < 0.1, skipping view {i}")
+                    #     continue
 
                     tgt_sparse_depth = tgt_out.depth[0] * tgt_valid_mask.float()
                     tgt_hole_mask = ~tgt_valid_mask
 
-                ctx_ref_image = context["image"][0][difix_anchor_idx]
-                difix_out = self.difix(prompt="remove degradation", image=tgt_rendered_rgb, ref_image=ctx_ref_image, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
-                fixed_image_tensor = torch.from_numpy(np.array(difix_out)).permute(2,0,1).to(device) / 255.0
-                fixed_image_tensor = fixed_image_tensor.unsqueeze(0)
+                # --- [Modified] Step B: Generate with PE-Field (Replacing DiFix) ---
+                anchor_image = context["image"][:, difix_anchor_idx] 
+                anchor_extrinsic = context["extrinsics"][:, difix_anchor_idx]
+                anchor_depth = context_depths[:, difix_anchor_idx]
+                target_extrinsic = extra_context["extrinsics"][:, i]
+
+                pe_ctx = {
+                    "image": anchor_image,
+                    "extrinsics": anchor_extrinsic
+                }
+                pe_tgt = {
+                    "extrinsics": target_extrinsic
+                }
+                print(f"Generating view {i} using PE-Field (with GT/Pred depth)...")
+                fixed_image_tensor, phi, theta, warped_image_tensor = self.pe_field(
+                    context=pe_ctx, 
+                    target=pe_tgt, 
+                    num_inference_steps=10,
+                )
+
+                print(f"Calculate the spherical offset: {phi}, {theta}")
 
                 # [DEBUG] Visualization
                 with torch.no_grad():
                     save_image(tgt_rendered_rgb, os.path.join(debug_dir, f"view_{i}_00_rgb_before.png"))
-                    save_image(fixed_image_tensor[0], os.path.join(debug_dir, f"view_{i}_00_rgb_after_difix.png"))
+                    save_image(fixed_image_tensor[0], os.path.join(debug_dir, f"view_{i}_00_rgb_after_pe_field.png"))
+                    save_image(warped_image_tensor[0], os.path.join(debug_dir, f"view_{i}_00_rgb_warped_pe_field.png"))
+                    anchor_depth_vis = visualize_depth(anchor_depth[0], cmap_name='Spectral')
+                    save_image(anchor_depth_vis, os.path.join(debug_dir, f"view_{i}_01_anchor_depth.png"))
                     sparse_depth_vis = visualize_depth(tgt_sparse_depth[0], cmap_name='Spectral')
                     save_image(sparse_depth_vis, os.path.join(debug_dir, f"view_{i}_01_sparse_depth.png"))
 
@@ -683,11 +702,11 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
 
                 # [DEBUG] Visualization
                 dense_depth_vis = visualize_depth(aligned_dense_depth, cmap_name='Spectral')
-                save_image(dense_depth_vis, os.path.join(debug_dir, f"view_{i}_02_dense_depth.png"))
+                save_image(dense_depth_vis, os.path.join(debug_dir, f"view_{i}_02_tgt_dense_depth.png"))
                 mask_vis = tgt_valid_mask.float().cpu().squeeze()  # [H, W]
                 if mask_vis.dim() == 2:
                     mask_vis = mask_vis.unsqueeze(0).repeat(3, 1, 1) # [3, H, W]
-                save_image(mask_vis, os.path.join(debug_dir, f"view_{i}_03_align_mask.png"))
+                save_image(mask_vis, os.path.join(debug_dir, f"view_{i}_03_tgt_align_mask.png"))
                 # # ---------------------------------------------------------------------
 
                 # # ---------------- align using target ---------------------------------
