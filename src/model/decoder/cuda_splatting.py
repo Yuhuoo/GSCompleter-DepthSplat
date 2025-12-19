@@ -7,7 +7,7 @@ from diff_gaussian_rasterization import (
     GaussianRasterizer,
 )
 from einops import einsum, rearrange, repeat
-from jaxtyping import Float
+from jaxtyping import Float, Int
 from torch import Tensor
 
 from ...geometry.projection import get_fov, homogenize_points
@@ -56,7 +56,7 @@ def render_cuda(
     gaussian_opacities: Float[Tensor, "batch gaussian"],
     scale_invariant: bool = True,
     use_sh: bool = True,
-) -> tuple[Float[Tensor, "batch 3 height width"], Float[Tensor, "batch 1 height width"], Float[Tensor, "batch 1 height width"]]:
+) -> tuple[Float[Tensor, "batch 3 height width"], Float[Tensor, "batch 1 height width"], Float[Tensor, "batch 1 height width"], Int[Tensor, "batch gaussian"]]:
     assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
 
     # Make sure everything is in a range where numerical issues don't appear.
@@ -127,7 +127,7 @@ def render_cuda(
         all_radii.append(radii)
         all_alpha_mask.append(alpha_mask)
         all_depth_map.append(depth_map)
-    return torch.stack(all_images), torch.stack(all_alpha_mask), torch.stack(all_depth_map)
+    return torch.stack(all_images), torch.stack(all_alpha_mask), torch.stack(all_depth_map), torch.stack(all_radii)
 
 
 def render_cuda_orthographic(

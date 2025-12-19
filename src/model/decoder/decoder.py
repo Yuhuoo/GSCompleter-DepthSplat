@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Generic, Literal, TypeVar
 
-from jaxtyping import Float
+from jaxtyping import Float, Int
 from torch import Tensor, nn
 
 from ...dataset import DatasetCfg
@@ -21,6 +21,7 @@ class DecoderOutput:
     color: Float[Tensor, "batch view 3 height width"]
     depth: Float[Tensor, "batch view 1 height width"]
     alpha: Float[Tensor, "batch view 1 height width"]
+    radii: Int[Tensor, "batch view gaussian"]
 
 
 T = TypeVar("T")
