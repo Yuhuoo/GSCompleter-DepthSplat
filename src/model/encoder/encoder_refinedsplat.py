@@ -205,23 +205,26 @@ def inverse_sigmoid(x):
 
 class GaussianTTOOptimizer(nn.Module):
     def __init__(self, 
-                 steps_stage1=50, 
-                 steps_stage2=50,       
-                 lr_pos_s2=0.00016,      
-                 lr_opa_s2=0.08,         
-                 lr_scale_s2=0.001,
-                 lr_rot_s2=0.001,
+                 steps_stage1=50,
+                 steps_stage2=30, 
+                 lr_opa_s2=0.08,
+                 steps_stage3=50,
+                 lr_pos_s3=0.00016,         
+                 lr_scale_s3=0.001,
+                 lr_opa_s3=0.08,
+                 lr_rot_s3=0.001,
                  max_scale=0.015,
                  context_view_sample_k=4
                  ):
         super().__init__()
         self.steps_stage1 = steps_stage1
         self.steps_stage2 = steps_stage2
-        
-        self.lr_pos_s2 = lr_pos_s2
+        self.steps_stage3 = steps_stage3
         self.lr_opa_s2 = lr_opa_s2
-        self.lr_scale_s2 = lr_scale_s2
-        self.lr_rot_s2 = lr_rot_s2
+        self.lr_pos_s3 = lr_pos_s3
+        self.lr_opa_s3 = lr_opa_s3
+        self.lr_scale_s3 = lr_scale_s3
+        self.lr_rot_s3 = lr_rot_s3
         self.max_scale = max_scale
         self.context_view_sample_k = context_view_sample_k
 
@@ -232,7 +235,8 @@ class GaussianTTOOptimizer(nn.Module):
                 context_render_pkg: dict,
                 target_render_pkg: dict,
                 hole_tags: torch.Tensor = None,
-                stereo_anchor_idx: int = None): # [新增参数]
+                stereo_anchor_idx: int = None,
+                monster_indices: torch.Tensor = None):
         
         device = target_gaussians.means.device
         
@@ -250,6 +254,9 @@ class GaussianTTOOptimizer(nn.Module):
                 curr_out = decoder(current_gaussians, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], target_render_pkg['near'], target_render_pkg['far'], (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
                 evaluator.evaluate(step_label, curr_out.depth[0].squeeze(1), gt_scene_depth, current_gaussians.means.squeeze(0), gt_scene_means, gt_valid_mask)
 
+        # --------------------------------------------------------------------------
+        # Eval-Before
+        # --------------------------------------------------------------------------
         run_eval("Pre-Stage1 (Raw Encoder)", target_gaussians)
 
         # --------------------------------------------------------------------------
@@ -301,7 +308,7 @@ class GaussianTTOOptimizer(nn.Module):
         # --------------------------------------------------------------------------
         # STAGE 1: Geometric Surface Alignment
         # --------------------------------------------------------------------------
-        print("  [TTO] Stage 1 (Merged Ray-Depth Optimization)...")
+        print("  [TTO] Stage 1 (Ray-Depth Optimization)...")
         
         with torch.no_grad():
             # 初始化距离
@@ -323,14 +330,11 @@ class GaussianTTOOptimizer(nn.Module):
             for step in range(self.steps_stage1):
                 optimizer_s1.zero_grad()
                 
-                # 1. 沿射线移动点
                 curr_means = cam_center + opt_dists * ray_dirs
                 curr_target_gaussians = self._build_gaussians(curr_means, opt_log_scales, opt_rotations, opt_opacities, opt_harmonics, c2w_rot)
-                
-                # 2. 与 Context 合并 (为了渲染遮挡关系，虽然 Stage1 主要看 Target)
                 merged_gaussians = self.merge_gaussians_for_render(flat_context_gaussians, curr_target_gaussians)
                 
-                # --- Loss A: Target View Depth (Monocular/Aligned) ---
+                # Loss A: Target Depth
                 render_out = decoder(merged_gaussians, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], target_render_pkg['near'], target_render_pkg['far'], (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
                 
                 loss_depth = (torch.abs(render_out.depth.squeeze(1) - gt_sparse_depth) * gt_mask).sum() / (gt_mask.sum() + 1e-6)
@@ -338,54 +342,52 @@ class GaussianTTOOptimizer(nn.Module):
                 
                 total_loss = 1.0 * loss_depth + 0.1 * loss_rgb
                 
-                # --- Loss B: [NEW] Stereo Reprojection Loss (Geometric Constraint) ---
+                if step % 10 == 0:
+                    print(f"    Step {step} | Target align: Depth Loss: {loss_depth.item():.4f}, RGB Loss: {loss_rgb.item():.4f}")
+                
+                # Loss B: Stereo Reprojection (Occlusion Aware)
                 if stereo_anchor_idx is not None:
-                    # 只渲染 Target Gaussians 到 Anchor 视角
-                    # 这样可以得到纯粹由 Target 生成的几何
-                    stereo_out = decoder(
-                        curr_target_gaussians, 
-                        anchor_extrinsics, anchor_intrinsics, anchor_near, anchor_far,
-                        (target_render_pkg['h'], target_render_pkg['w']), 
-                        depth_mode="depth"
-                    )
+                    stereo_out = decoder(curr_target_gaussians, anchor_extrinsics, anchor_intrinsics, anchor_near, anchor_far, (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
                     stereo_depth = stereo_out.depth[0]
                     stereo_alpha = stereo_out.alpha[0]
                     
-                    # 只在 Target 投影有效 且 Anchor GT 有效 的区域计算
-                    # Alpha > 0.5 意味着这个高斯球确实“占据”了 Anchor 的像素
+                    # # Filter: Only punish if point is BEHIND or ON surface (allow occlusion, disallow flying in front)
+                    # epsilon = 0.05
+                    # depth_consistency_mask = stereo_depth >= (anchor_gt_depth - epsilon)
+                    # valid_stereo_mask = (stereo_alpha > 0.5) & anchor_valid_mask & depth_consistency_mask
                     valid_stereo_mask = (stereo_alpha > 0.5) & anchor_valid_mask
-                    
+
                     if valid_stereo_mask.sum() > 100:
                         loss_stereo = torch.abs(stereo_depth - anchor_gt_depth)
                         loss_stereo = (loss_stereo * valid_stereo_mask).sum() / (valid_stereo_mask.sum() + 1e-6)
-                        
-                        # 强约束！
                         total_loss += 1.0 * loss_stereo
                         
-                        # [Debug log]
-                        if step % 20 == 0:
+                        if step % 10 == 0:
                             print(f"    Step {step} | Stereo Loss: {loss_stereo.item():.4f}")
 
                 total_loss.backward()
                 optimizer_s1.step()
-                
-                # 约束：距离不能为负
-                with torch.no_grad(): opt_dists.data = torch.clamp(opt_dists.data, min=0.1)
+                with torch.no_grad(): 
+                    opt_dists.data = torch.clamp(opt_dists.data, min=0.1)
 
         # --------------------------------------------------------------------------
-        # Filtering
+        # Eval-After
         # --------------------------------------------------------------------------
-        print("  [TTO] Filtering by Hole Tags...")
         with torch.no_grad():
             final_means_s1 = cam_center + opt_dists.detach() * ray_dirs 
             target_gaussians.means = final_means_s1.unsqueeze(0).detach()
             
             run_eval("Post-Stage1 (Stereo Optimized)", target_gaussians)
 
+        # --------------------------------------------------------------------------
+        # STAGE 2: Hard Hole Filter
+        # --------------------------------------------------------------------------
+        print("  [TTO] Stage 2 Hole Filter...")
+        with torch.no_grad():
             if hole_tags is not None: keep_mask = hole_tags.to(device)
             else: keep_mask = torch.ones(final_means_s1.shape[0], dtype=torch.bool, device=device)
             
-            print(f"  [Filter] Points before: {len(final_means_s1)} -> after: {keep_mask.sum()}")
+            print(f"  [TTO Stage 2-Filter] Points before: {len(final_means_s1)} -> after: {keep_mask.sum()}")
             if keep_mask.sum() == 0: return target_gaussians
 
             valid_means = final_means_s1[keep_mask]
@@ -394,10 +396,129 @@ class GaussianTTOOptimizer(nn.Module):
             valid_opacities = opt_opacities[keep_mask]
             valid_harmonics = opt_harmonics[keep_mask]
 
+        # # --------------------------------------------------------------------------
+        # # STAGE 2: Hard Hole Filter with dilation
+        # # --------------------------------------------------------------------------
+        # print("  [TTO] Stage 2 Hole Filter...")
+        # assert hole_tags is not None, "Hole mask must be here."
+        # H, W = target_render_pkg['h'], target_render_pkg['w']
+        # hole_mask_2d = hole_tags.view(1, 1, H, W).float()
+        # dilation_radius = 5 # 向外扩张5个像素
+        # kernel_size = 2 * dilation_radius + 1
+        # padding = dilation_radius
+        # dilated_hole_mask = F.max_pool2d(hole_mask_2d, kernel_size=kernel_size, stride=1, padding=padding)
+        # keep_mask = (dilated_hole_mask.view(-1) > 0.5)
+        # print(f"  [TTO Stage 2-Filter Mask Dilation] Original Hole: {hole_tags.sum()} -> Dilated Hole (+{dilation_radius}px): {keep_mask.sum()} pixels.")
+       
+        # with torch.no_grad():
+        #     print(f"  [TTO] Stage 2-Filter Points before: {len(final_means_s1)} -> after: {keep_mask.sum()}")
+        #     if keep_mask.sum() == 0: return target_gaussians
+
+        #     valid_means = final_means_s1[keep_mask]
+        #     valid_log_scales = opt_log_scales[keep_mask]
+        #     valid_rotations = opt_rotations[keep_mask]
+        #     valid_opacities = opt_opacities[keep_mask]
+        #     valid_harmonics = opt_harmonics[keep_mask]
+
         # --------------------------------------------------------------------------
-        # STAGE 2: Refinement (随机采样 K 个 Context 视角)
+        # STAGE 2.5: Context Monster targeted optimization
+        # 核心逻辑：仅开启 opacity 梯度，通过 RGB 和 Coverage 损失优化怪物高斯的透明度
         # --------------------------------------------------------------------------
-        print("  [TTO] Stage 2 (Unified RGB Refinement - Random K Views)...")
+        # has_monsters = monster_indices is not None and monster_indices.numel() > 0
+        # if has_monsters:
+        #     print(f"  [TTO Stage 2.5] Optimizing {monster_indices.numel()} Monster Opacities...")
+            
+        #     # 1. 提取怪物参数：仅开启 opacities 的梯度
+        #     m_means = flat_context_gaussians.means[:, monster_indices].squeeze(0)
+        #     m_log_scales = torch.log(flat_context_gaussians.scales[:, monster_indices].squeeze(0).clamp(min=1e-10))
+        #     m_rots = flat_context_gaussians.rotations[:, monster_indices].squeeze(0)
+        #     m_harms = flat_context_gaussians.harmonics[:, monster_indices].squeeze(0)
+            
+        #     m_opas = flat_context_gaussians.opacities[:, monster_indices].squeeze(0).detach().requires_grad_(True)
+
+        #     # 2. 构建静态背景 (剔除怪物)
+        #     all_indices = torch.arange(flat_context_gaussians.means.shape[1], device=device)
+        #     monster_mask = torch.ones(len(all_indices), dtype=torch.bool, device=device)
+        #     monster_mask[monster_indices] = False
+            
+        #     bg_data = {
+        #         field.name: getattr(flat_context_gaussians, field.name)[:, monster_mask].detach()
+        #         for field in fields(Gaussians) if getattr(flat_context_gaussians, field.name) is not None
+        #     }
+        #     bg_context_gaussians = Gaussians(**bg_data)
+
+        #     # 3. 优化器配置：仅优化不透明度
+        #     optimizer_monster = torch.optim.Adam([{'params': [m_opas], 'lr': self.lr_opa_s2}], eps=1e-15)
+
+        #     # 4. 优化循环
+        #     with torch.enable_grad():
+        #         for step in range(self.steps_stage2):
+        #             optimizer_monster.zero_grad()
+        #             curr_m = self._build_gaussians(m_means, m_log_scales, m_rots, m_opas, m_harms, c2w_rot)
+        #             temp_tgt = self._build_gaussians(valid_means, valid_log_scales, valid_rotations, valid_opacities, valid_harmonics, c2w_rot)
+
+        #             render_pkg = self.merge_gaussians_for_render(bg_context_gaussians, curr_m)
+        #             render_pkg = self.merge_gaussians_for_render(render_pkg, temp_tgt)
+                    
+        #             out = decoder(
+        #                 render_pkg, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], 
+        #                 target_render_pkg['near'], target_render_pkg['far'], 
+        #                 (target_render_pkg['h'], target_render_pkg['w']), depth_mode=None
+        #             )
+
+        #             loss_rgb = l1_loss(out.color[0], gt_image[0])
+        #             loss_rgb.backward()
+        #             optimizer_monster.step()
+
+        #             if step % 10 == 0:
+        #                 print(f"  [TTO Stage 2] Step {step}: RGB Loss: {loss_rgb.item():.4f}")
+
+        #     # 5. 写回全局 Context 并更新协方差
+        #     with torch.no_grad():
+        #         flat_context_gaussians.opacities[:, monster_indices] = m_opas.unsqueeze(0)
+        #         updated_m = self._build_gaussians(m_means, m_log_scales, m_rots, m_opas, m_harms, c2w_rot)
+        #         flat_context_gaussians.covariances[:, monster_indices] = updated_m.covariances
+
+        # self.steps_stage2_baking = 50
+        # print(f"  [TTO] Stage 2: Opacity Baking ({self.steps_stage2_baking} steps)...")
+        # opt_means = valid_means.clone().detach().requires_grad_(False)
+        # opt_log_scales = valid_log_scales.clone().detach().requires_grad_(False)
+        # opt_rotations = valid_rotations.clone().detach().requires_grad_(False)
+        # opt_opacities = valid_opacities.clone().detach().requires_grad_(True)
+        # opt_harmonics = valid_harmonics.clone().detach().requires_grad_(False) 
+        
+        # # High LR for Baking
+        # self.lr_opa_baking = 0.2
+        # optimizer_baking = torch.optim.Adam([opt_opacities], lr=self.lr_opa_baking)
+
+        # # Opacity-baking
+        # with torch.enable_grad():
+        #     for step in range(self.steps_stage2_baking):
+        #         optimizer_baking.zero_grad()
+        #         curr_tgt_active = self._build_gaussians(opt_means, opt_log_scales, opt_rotations, opt_opacities, opt_harmonics, c2w_rot)
+        #         merged_gaussians = self.merge_gaussians_for_render(flat_context_gaussians, curr_tgt_active)
+        #         out = decoder(merged_gaussians, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], target_render_pkg['near'], target_render_pkg['far'], (target_render_pkg['h'], target_render_pkg['w']), depth_mode=None)
+        #         loss_rgb = l1_loss(out.color[0], gt_image[0])
+        #         loss_rgb.backward()
+        #         optimizer_baking.step()
+        #         if step % 10 == 0:
+        #             print(f"    Step {step} | Baking L1: {loss_rgb.item():.4f}")
+
+        # # STAGE 2-Pruning: (Post Stage 2)
+        # with torch.no_grad():
+        #     mask_keep = torch.sigmoid(opt_opacities) > 0.2
+        #     print(f"  [Filter Stage-2] Points before: {len(opt_means)} -> after: {mask_keep.sum()}")
+        #     if mask_keep.sum() == 0: return target_gaussians
+        #     valid_means = opt_means[mask_keep]
+        #     valid_log_scales = opt_log_scales[mask_keep]
+        #     valid_rotations = opt_rotations[mask_keep]
+        #     valid_opacities = opt_opacities[mask_keep]
+        #     valid_harmonics = opt_harmonics[mask_keep]
+
+        # --------------------------------------------------------------------------
+        # STAGE 3: Refinement (随机采样 K 个 Context 视角)
+        # --------------------------------------------------------------------------
+        print("  [TTO] Stage 3 (Unified RGB Refinement - Random K Views)...")
         
         opt_means = valid_means.clone().detach().requires_grad_(True)
         opt_log_scales = valid_log_scales.clone().detach().requires_grad_(True)
@@ -406,16 +527,16 @@ class GaussianTTOOptimizer(nn.Module):
         opt_harmonics = valid_harmonics.clone().detach().requires_grad_(False) 
 
         optimizer_s2 = torch.optim.Adam([
-            {'params': [opt_means], 'lr': self.lr_pos_s2}, 
-            {'params': [opt_log_scales], 'lr': self.lr_scale_s2},
-            {'params': [opt_rotations], 'lr': self.lr_rot_s2},
-            {'params': [opt_opacities], 'lr': self.lr_opa_s2},
+            {'params': [opt_means], 'lr': self.lr_pos_s3}, 
+            {'params': [opt_log_scales], 'lr': self.lr_scale_s3},
+            {'params': [opt_rotations], 'lr': self.lr_rot_s3},
+            {'params': [opt_opacities], 'lr': self.lr_opa_s3},
         ], eps=1e-15)
 
         num_ctx_views = context_render_pkg['image'].shape[1]
         
         with torch.enable_grad():
-            for step in range(self.steps_stage2):
+            for step in range(self.steps_stage3):
                 optimizer_s2.zero_grad()
                 with torch.no_grad():
                     opt_log_scales.data = torch.clamp(opt_log_scales.data, max=torch.log(torch.tensor(self.max_scale, device=device)))
@@ -453,11 +574,9 @@ class GaussianTTOOptimizer(nn.Module):
                 optimizer_s2.step()
                 
                 if step % 20 == 0:
-                    print(f"  [TTO Stage-2] Step {step}: AvgRGB={final_loss.item():.4f} (Views: {views_count})")
+                    print(f"  [TTO Stage-3] Step {step}: AvgRGB={final_loss.item():.4f} (Views: {views_count})")
 
-        # --------------------------------------------------------------------------
-        # Pruning & Return (保持不变)
-        # --------------------------------------------------------------------------
+        # Pruning & Return
         with torch.no_grad():
             final_scales = torch.exp(opt_log_scales)
             mask_keep = torch.sigmoid(opt_opacities) > 0.05 
@@ -530,7 +649,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
         
         # 1. Using Positional-Encoding Field
         print("Loading PE Pipeline (from ~/code/pe_field)...")
-        external_pe_root = os.path.expanduser("~/code")
+        external_pe_root = os.path.expanduser("~/gaoao/code")
         if external_pe_root not in sys.path:
             sys.path.insert(0, external_pe_root)
             
@@ -566,7 +685,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
         context_depths = res_context["depths"]
         
         flat_context_gaussians = self._flatten_and_merge_gaussians([original_context_gaussians], batch_size=1)
-        final_output_list = [self._clone_gaussians_data(original_context_gaussians)]
+        final_output_list = []
 
         # [DEBUG] save context image
         output_dir = get_cfg().get("output_dir", "experiments/debug")
@@ -606,9 +725,58 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                 # Step A: Check Coverage (Render current Gaussians)
                 with torch.no_grad():
                     tgt_out = decoder(flat_context_gaussians, extra_context["extrinsics"][:, i:i+1], extra_context["intrinsics"][:, i:i+1], extra_context["near"][:, i:i+1], extra_context["far"][:, i:i+1], (h, w), depth_mode="depth")
+                    
+                    # ================= [Online Get mask: Based on Radii] =================
+                    current_radii = tgt_out.radii.view(-1) # [N]
+                    prune_threshold = 20 
+                    mask_to_prune = current_radii > prune_threshold
+                    # scales = flat_context_gaussians.scales
+                    # big_points_ws = scales.max(dim=1).values > 3.0
+                    # mask_to_prune = torch.logical_or(big_points_vs, big_points_ws)
+                    if mask_to_prune.sum() > 0:
+                        print(f"  [Radii Pruning] Detected {mask_to_prune.sum()} artifacts (Radii > {prune_threshold}). Removing...")
+                        mask_keep = ~mask_to_prune
+
+                        # 更新 context
+                        new_data = {}
+                        for field in fields(Gaussians):
+                            val = getattr(flat_context_gaussians, field.name)
+                            if val is not None:
+                                new_data[field.name] = val[:, mask_keep]
+                        temp_flat_context_gaussians = Gaussians(**new_data)
+                        
+                        # Re-Render
+                        tgt_out = decoder(
+                            temp_flat_context_gaussians, 
+                            extra_context["extrinsics"][:, i:i+1], 
+                            extra_context["intrinsics"][:, i:i+1], 
+                            extra_context["near"][:, i:i+1], 
+                            extra_context["far"][:, i:i+1], 
+                            (h, w), 
+                            depth_mode="depth"
+                        )
+                    else:
+                        print("  [Radii Pruning] No large artifacts detected. Skipping re-render.")
+                    # ================= [Online Get mask: Based on Radii] =================
+
+                    final_output_list.append(self._clone_gaussians_data(flat_context_gaussians))
                     tgt_rendered_rgb = tgt_out.color[0]
                     tgt_opacity_mask = tgt_out.alpha[0]
-                    tgt_valid_mask = tgt_opacity_mask > 0.5
+                    tgt_hole_mask = tgt_opacity_mask < 0.5
+
+                    # 2. [TRICK] 向外膨胀1个像素
+                    dilation_radius = 1
+                    hole_mask_float = tgt_hole_mask.float().view(1, 1, h, w)
+                    kernel_size = 2 * dilation_radius + 1
+                    padding = dilation_radius
+                    dilated_hole_mask = F.max_pool2d(
+                        hole_mask_float,
+                        kernel_size=kernel_size,
+                        stride=1,
+                        padding=padding
+                    )
+                    tgt_hole_mask = (dilated_hole_mask > 0).view(1, h, w)
+                    tgt_valid_mask = ~tgt_hole_mask
 
                     # coverage_ratio = (tgt_opacity_mask > 0.99).float().mean().item()
                     # should_pass = coverage_ratio < 0.1
@@ -617,7 +785,31 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                     #     continue
 
                     tgt_sparse_depth = tgt_out.depth[0] * tgt_valid_mask.float()
-                    tgt_hole_mask = ~tgt_valid_mask
+                    # tgt_hole_mask = ~tgt_valid_mask
+                
+                # # ================= [Monster Index Tracking] =================
+                # current_radii = tgt_out.radii.view(-1).float()
+                # # hard_limit = 200.0
+                # hard_limit = torch.quantile(current_radii, 0.99)
+                # is_monster = current_radii > hard_limit
+                # monster_indices = torch.where(is_monster)[0]
+                # num_monsters = monster_indices.numel()
+                # if num_monsters > 0:
+                #     print(f"  [Monster Tracking] Found {num_monsters} monsters in Context. Passing indices to TTO Stage 2.")
+                # # ================= [Monster Index Tracking] =================
+                # final_output_list.append(self._clone_gaussians_data(flat_context_gaussians))
+                # tgt_rendered_rgb = tgt_out.color[0]
+                # tgt_opacity_mask = tgt_out.alpha[0]
+                # tgt_valid_mask = tgt_opacity_mask > 0.5
+
+                # # coverage_ratio = (tgt_opacity_mask > 0.99).float().mean().item()
+                # # should_pass = coverage_ratio < 0.1
+                # # if should_pass:
+                # #     print(f"Coverage {coverage_ratio:.3f} < 0.1, skipping view {i}")
+                # #     continue
+
+                # tgt_sparse_depth = tgt_out.depth[0] * tgt_valid_mask.float()
+                # tgt_hole_mask = ~tgt_valid_mask
 
                 # --- [Modified] Step B: Generate with PE-Field (Replacing DiFix) ---
                 anchor_image = context["image"][:, difix_anchor_idx] 
@@ -652,6 +844,8 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                     save_image(sparse_depth_vis, os.path.join(debug_dir, f"view_{i}_01_sparse_depth.png"))
 
                 # Step B: Predict Target Gaussians on Paired Views
+                
+                # stereo_anchor_idx = int(assignments[i])
                 stereo_anchor_idx = int(stereo_assignments[i])
                 print(f"Calculate Gaussian Using Anchor: {stereo_anchor_idx} ")
                 with torch.no_grad():
@@ -787,7 +981,9 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                         context_render_pkg=context_render_pkg, 
                         target_render_pkg=target_render_pkg,
                         hole_tags=hole_tags,
-                        stereo_anchor_idx=stereo_anchor_idx
+                        stereo_anchor_idx=stereo_anchor_idx,
+                        monster_indices=None,
+                        # monster_indices=monster_indices
                     )
                     # 3. 收集结果
                     final_output_list.append(self._clone_gaussians_data(refined_target_gaussians))
@@ -828,7 +1024,8 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
             # [DEBUG] save context image
             vis_dir = os.path.join(output_dir, "after", scene_name)
             self._save_images(decoder, flat_context_gaussians, context_render_pkg, h, w, vis_dir)
-
+        else:
+            final_output_list.append(self._clone_gaussians_data(original_context_gaussians))
         final_gaussians = self._flatten_and_merge_gaussians(final_output_list, batch_size=1)
         
         if self.cfg.return_depth: 
