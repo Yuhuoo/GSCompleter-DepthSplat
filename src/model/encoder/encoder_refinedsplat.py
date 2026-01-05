@@ -21,6 +21,8 @@ from .common.gaussians import build_covariance
 class GeometricEvaluator:
     def __init__(self, device):
         self.device = device
+        self.pre_stage1_history = []
+        self.post_stage1_history = []
 
     def filter_outliers_by_box(self, pred_pts, gt_pts, margin=0.1):
         if pred_pts.shape[0] == 0 or gt_pts.shape[0] == 0:
@@ -33,51 +35,31 @@ class GeometricEvaluator:
         in_box_mask = (pred_pts >= box_min) & (pred_pts <= box_max)
         in_box_mask = in_box_mask.all(dim=1)
         filtered_pred = pred_pts[in_box_mask]
-        if filtered_pred.shape[0] < 100:
-            return pred_pts
-        return filtered_pred
+        return filtered_pred if filtered_pred.shape[0] >= 100 else pred_pts
 
     def robust_chamfer_distance(self, p1, p2):
-        """
-        p1: Prediction [N, 3]
-        p2: Ground Truth [M, 3]
-        """
         N_max = 5000
         if p1.shape[0] > N_max: p1 = p1[torch.randperm(p1.shape[0])[:N_max]]
         if p2.shape[0] > N_max: p2 = p2[torch.randperm(p2.shape[0])[:N_max]]
         
-        # 计算距离矩阵 (Euclidean)
         dists = torch.cdist(p1, p2, p=2) 
-        
         min_dist_pred, _ = torch.min(dists, dim=1) 
         min_dist_gt, _ = torch.min(dists, dim=0)
         
         chamfer_dist = torch.mean(min_dist_pred) + torch.mean(min_dist_gt)
-        
-        # [改进 2] 动态计算 F-Score 阈值
-        # 策略：计算 GT 点云的包围盒对角线长度，取其 1% 或 5% 作为阈值
-        # 这能适应任何尺度的场景 (无论是 1.0 还是 100.0)
         gt_span = p2.max(dim=0)[0] - p2.min(dim=0)[0]
-        scene_scale = torch.norm(gt_span).item() # 对角线长度
-        
-        # 常用标准：Scene Scale 的 1% (严格) 或 5% (宽松)
-        # 鉴于 Unimatch 是稠密预测，我们用 2% 作为一个中肯标准
+        scene_scale = torch.norm(gt_span).item()
         threshold = 0.01 * scene_scale 
         
         precision = (min_dist_pred < threshold).float().mean()
         recall = (min_dist_gt < threshold).float().mean()
         f_score = 2 * precision * recall / (precision + recall + 1e-8)
         
-        # 返回 Threshold 方便 debug
         return chamfer_dist.item(), f_score.item(), threshold
 
     def evaluate(self, step_name, pred_depth, gt_depth, pred_means, gt_means, valid_mask):
         metrics = {}
-        
-        # --- 2D Metrics ---
-        # 增加极小值保护，防止 AbsRel 算除法时爆炸
         valid_mask = valid_mask & (gt_depth > 1e-3) & (pred_depth > 1e-3)
-        
         p = pred_depth[valid_mask]
         g = gt_depth[valid_mask]
         
@@ -88,21 +70,61 @@ class GeometricEvaluator:
             metrics['AbsRel'] = abs_rel
             metrics['Acc1.25'] = acc_125
         else:
-            metrics['AbsRel'] = 1.0
-            metrics['Acc1.25'] = 0.0
+            metrics['AbsRel'], metrics['Acc1.25'] = 1.0, 0.0
 
-        # --- 3D Metrics ---
         clean_pred_means = self.filter_outliers_by_box(pred_means, gt_means)
-        
-        # 获取 metrics 和 动态计算的 threshold
         cd, f_score, adaptive_thresh = self.robust_chamfer_distance(clean_pred_means, gt_means)
         metrics['Chamfer'] = cd
         metrics['F-Score'] = f_score
+
+        if "Pre-Stage1" in step_name:
+            self.pre_stage1_history.append(metrics)
+        elif "Post-Stage1" in step_name:
+            self.post_stage1_history.append(metrics)
 
         print(f"  [EVAL @ {step_name}] AbsRel: {metrics['AbsRel']:.3f} | Acc1.25: {metrics['Acc1.25']:.3f} | "
               f"CD: {metrics['Chamfer']:.3f} | F-Score(@{adaptive_thresh:.2f}): {metrics['F-Score']:.3f}")
         
         return metrics
+
+    def _compute_avg(self, history):
+        if not history: return None
+        keys = history[0].keys()
+        return {key: sum(m[key] for m in history) / len(history) for key in keys}
+
+    def summarize(self, save_path: str = None):
+        """对比打印 Pre 和 Post 的全局平均指标，并可选保存到 txt"""
+        pre_avg = self._compute_avg(self.pre_stage1_history)
+        post_avg = self._compute_avg(self.post_stage1_history)
+
+        lines = []
+        lines.append("\n" + "="*80)
+        lines.append(f"{'METRIC':<15} | {'PRE-TTO (Avg)':<20} | {'POST-TTO (Avg)':<20} | {'IMPROVE':<15}")
+        lines.append("-" * 80)
+        
+        if pre_avg and post_avg:
+            for key in pre_avg.keys():
+                diff = pre_avg[key] - post_avg[key]
+                # 某些指标是越大越好（如 Acc, F-Score），某些是越小越好（如 AbsRel, CD）
+                if key in ['Acc1.25', 'F-Score']:
+                    diff = -diff # 变成正数表示提升
+                
+                line = f"{key:<15} | {pre_avg[key]:<20.4f} | {post_avg[key]:<20.4f} | {diff:>+14.4f}"
+                lines.append(line)
+        else:
+            lines.append(f"Missing data. Pre: {len(self.pre_stage1_history)}, Post: {len(self.post_stage1_history)}")
+        
+        lines.append("="*80 + "\n")
+        
+        summary_str = "\n".join(lines)
+        print(summary_str) # 保持控制台输出
+
+        # 如果提供了路径，则写入文件
+        if save_path:
+            with open(save_path, 'w', encoding='utf-8') as f:
+                f.write(summary_str)
+        
+        return summary_str
 
 # -----------------------------------------------------------------------------
 # Helper Functions
@@ -228,6 +250,8 @@ class GaussianTTOOptimizer(nn.Module):
         self.max_scale = max_scale
         self.context_view_sample_k = context_view_sample_k
 
+        self.evaluator = GeometricEvaluator("cuda")
+
     def forward(self,
                 decoder,
                 target_gaussians: Gaussians, 
@@ -239,9 +263,7 @@ class GaussianTTOOptimizer(nn.Module):
                 monster_indices: torch.Tensor = None):
         
         device = target_gaussians.means.device
-        
-        # ... (Evaluator 和 GT 准备代码，保持不变) ...
-        evaluator = GeometricEvaluator(device)
+
         with torch.no_grad():
             flat_context_gaussians = self.flatten_gaussians(context_gaussians)
             gt_render_out = decoder(context_gaussians, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], target_render_pkg['near'], target_render_pkg['far'], (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
@@ -252,8 +274,8 @@ class GaussianTTOOptimizer(nn.Module):
         def run_eval(step_label, current_gaussians):
             with torch.no_grad():
                 curr_out = decoder(current_gaussians, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], target_render_pkg['near'], target_render_pkg['far'], (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
-                evaluator.evaluate(step_label, curr_out.depth[0].squeeze(1), gt_scene_depth, current_gaussians.means.squeeze(0), gt_scene_means, gt_valid_mask)
-
+                self.evaluator.evaluate(step_label, curr_out.depth[0].squeeze(1), gt_scene_depth, current_gaussians.means.squeeze(0), gt_scene_means, gt_valid_mask)
+        
         # --------------------------------------------------------------------------
         # Eval-Before
         # --------------------------------------------------------------------------
@@ -763,20 +785,22 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                     tgt_rendered_rgb = tgt_out.color[0]
                     tgt_opacity_mask = tgt_out.alpha[0]
                     tgt_hole_mask = tgt_opacity_mask < 0.5
-
-                    # 2. [TRICK] 向外膨胀1个像素
-                    dilation_radius = 1
-                    hole_mask_float = tgt_hole_mask.float().view(1, 1, h, w)
-                    kernel_size = 2 * dilation_radius + 1
-                    padding = dilation_radius
-                    dilated_hole_mask = F.max_pool2d(
-                        hole_mask_float,
-                        kernel_size=kernel_size,
-                        stride=1,
-                        padding=padding
-                    )
-                    tgt_hole_mask = (dilated_hole_mask > 0).view(1, h, w)
                     tgt_valid_mask = ~tgt_hole_mask
+                    tgt_sparse_depth = tgt_out.depth[0] * tgt_valid_mask.float()
+
+                    # # 2. [TRICK] 向外膨胀1个像素
+                    # dilation_radius = 1
+                    # hole_mask_float = tgt_hole_mask.float().view(1, 1, h, w)
+                    # kernel_size = 2 * dilation_radius + 1
+                    # padding = dilation_radius
+                    # dilated_hole_mask = F.max_pool2d(
+                    #     hole_mask_float,
+                    #     kernel_size=kernel_size,
+                    #     stride=1,
+                    #     padding=padding
+                    # )
+                    # tgt_hole_mask = (dilated_hole_mask > 0).view(1, h, w)
+                    # tgt_valid_mask = ~tgt_hole_mask
 
                     # coverage_ratio = (tgt_opacity_mask > 0.99).float().mean().item()
                     # should_pass = coverage_ratio < 0.1
@@ -784,7 +808,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                     #     print(f"Coverage {coverage_ratio:.3f} < 0.1, skipping view {i}")
                     #     continue
 
-                    tgt_sparse_depth = tgt_out.depth[0] * tgt_valid_mask.float()
+                    # tgt_sparse_depth = tgt_out.depth[0] * tgt_valid_mask.float()
                     # tgt_hole_mask = ~tgt_valid_mask
                 
                 # # ================= [Monster Index Tracking] =================
@@ -888,7 +912,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                 print(f"  [Depth Align via Anchor] Scale: {scale:.4f}, Shift: {shift:.4f}")
                 
                 # 5. 将参数应用到 Target (Apply to Target)
-                # 公式: Depth_aligned = scale * Depth_mono + shift
+                # aligned_dense_depth = target_pred_depth * 1.0 + 0.0
                 aligned_dense_depth = target_pred_depth * scale + shift
                 
                 # 安全截断，防止数值爆炸
