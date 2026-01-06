@@ -75,6 +75,7 @@ test:
   save_image: false
   save_video: false
   save_gt_image: false
+  render_context: false
   save_input_images: false
   save_depth: false
   using_refinement: false
@@ -84,6 +85,10 @@ test:
   render_chunk_size: null
   stablize_camera: false
   stab_camera_kernel: 50
+  using_stereo_anchor: false
+  using_depth_alignment: false
+  using_rc_register: false
+  using_mv_refinement: false
 
 seed: 111123
 

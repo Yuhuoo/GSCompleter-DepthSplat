@@ -64,6 +64,7 @@ class TestCfg:
     save_video: bool
     eval_time_skip_steps: int
     save_gt_image: bool
+    render_context: bool
     save_input_images: bool
     save_depth: bool
     using_refinement: bool
@@ -73,6 +74,10 @@ class TestCfg:
     render_chunk_size: int | None
     stablize_camera: bool
     stab_camera_kernel: int
+    using_stereo_anchor: bool
+    using_depth_alignment: bool
+    using_rc_register: bool
+    using_mv_refinement: bool
 
 
 @dataclass
@@ -244,9 +249,13 @@ class ModelWrapper(LightningModule):
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
 
-        # [DEBUG]
-        if batch['scene'][0] != "0bfdd020cf475b9c68e4b469d1d1a2d0cad303eefe8b78fb2307855afdaac8be":
-            return
+        # # [DEBUG]
+        # if batch['scene'][0] != "0bfdd020cf475b9c68e4b469d1d1a2d0cad303eefe8b78fb2307855afdaac8be":
+        #     return
+        # if batch['scene'][0] != "0a1b7c20a92c43c6b8954b1ac909fb2f0fa8b2997b80604bc8bbec80a1cb2da3":
+        #     return
+        # if batch['scene'][0] != "3b16a10ec9b4ab71580958b634485a979ffd6df0d368dbbf6fc1c5ffacf46b7a":
+        #     return
 
         pred_depths = None
 
