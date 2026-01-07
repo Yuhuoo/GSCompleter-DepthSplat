@@ -167,6 +167,9 @@ outputs
 output
 checkpoints
 assets
-experiments
+*experiments*
 dinov2-main
 difix3d
+PE-Field
+*backup*
+*pe-field*
