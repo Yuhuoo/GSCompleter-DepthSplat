@@ -17,7 +17,7 @@ COMMON_ARGS="+experiment=dl3dv mode=test \
     test.render_context=true"
 
 # 基础输出路径
-BASE_OUT="new_experiments/1.6/pe-field-4"
+BASE_OUT="new_experiments/1.7/pe-field-4"
 SUB_DIR="dl3dv_ctx_1v_tgt_2v_n10"
 
 # 2. 定义实验配置数组

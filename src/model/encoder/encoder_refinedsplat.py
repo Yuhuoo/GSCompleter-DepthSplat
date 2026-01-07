@@ -728,7 +728,6 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
         context_depths = res_context["depths"]
         
         flat_context_gaussians = self._flatten_and_merge_gaussians([original_context_gaussians], batch_size=1)
-        final_output_list = []
 
         # [DEBUG] save context image
         output_dir = get_cfg().get("output_dir")
@@ -817,7 +816,6 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
 
                     tgt_valid_mask = ~tgt_hole_mask
                     tgt_sparse_depth = tgt_out.depth[0] * tgt_valid_mask.float()
-                    final_output_list.append(self._clone_gaussians_data(flat_context_gaussians))
 
                     # # 2. [TRICK] 向外膨胀1个像素
                     # dilation_radius = 1
@@ -852,7 +850,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                 # if num_monsters > 0:
                 #     print(f"  [Monster Tracking] Found {num_monsters} monsters in Context. Passing indices to TTO Stage 2.")
                 # # ================= [Monster Index Tracking] =================
-                # final_output_list.append(self._clone_gaussians_data(flat_context_gaussians))
+
                 # tgt_rendered_rgb = tgt_out.color[0]
                 # tgt_opacity_mask = tgt_out.alpha[0]
                 # tgt_valid_mask = tgt_opacity_mask > 0.5
@@ -1054,9 +1052,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                         using_rc_register=using_rc_register,
                         using_mv_refinement=using_mv_refinement,
                     )
-                    # 3. 收集结果
-                    final_output_list.append(self._clone_gaussians_data(refined_target_gaussians))
-                    
+
                     # 4. [关键更新 A] 将优化后的 Target Gaussians 合并进 Context Gaussians
                     # 这样下一个 Target 就能看到当前 Target 产生的几何信息
                     flat_context_gaussians = self._flatten_and_merge_gaussians(
@@ -1095,18 +1091,13 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
             # vis_dir = os.path.join(output_dir, "debug/after", scene_name)
             # self._save_images(decoder, flat_context_gaussians, context_render_pkg, h, w, vis_dir)
         
-        else:
-            final_output_list.append(self._clone_gaussians_data(original_context_gaussians))
-        
-        final_gaussians = self._flatten_and_merge_gaussians(final_output_list, batch_size=1)
-        
         if self.cfg.return_depth: 
             return {
-                    "gaussians": final_gaussians, 
+                    "gaussians": flat_context_gaussians, 
                     "depths": context_depths
                 }
         
-        return final_gaussians
+        return flat_context_gaussians
     
     def _save_images(self, decoder, gaussians, context, h, w, output_dir):
         os.makedirs(output_dir, exist_ok=True)
