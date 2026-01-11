@@ -82,7 +82,7 @@ class MultiViewUniMatch(nn.Module):
         #     "facebookresearch/dinov2", "dinov2_{:}14".format(encoder), source='local'
         # )
         self.pretrained = torch.hub.load('dinov2-main', "dinov2_{:}14".format(encoder), source='local', pretrained=False)
-        model_path = "./pretrained/dinov2_vitb14_pretrain.pth"
+        model_path = f"./pretrained/dinov2_{encoder}14_pretrain.pth"
         try:
             state_dict = torch.load(model_path, map_location='cpu')
             self.pretrained.load_state_dict(state_dict)

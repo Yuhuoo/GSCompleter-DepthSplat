@@ -229,7 +229,7 @@ def inference(cfg_dict: DictConfig):
     # 源代码备份
     backup_dir = output_dir / "backup"
     backup_dir.mkdir(exist_ok=True)
-    shutil.copy2("src/model/encoder/encoder_refinedsplat.py", backup_dir)
+    shutil.copyfile("src/model/encoder/encoder_refinedsplat.py", os.path.join(backup_dir, "encoder_refinedsplat.py"))
 
     print(cyan(f"Done. Outputs saved to {output_dir}"))
 
