@@ -116,7 +116,7 @@ def export_ply(
 
 def save_gaussian_ply(gaussians, visualization_dump, example, save_path):
     # 确保父目录存在
-    save_path.parent.mkdir(parents=True, exist_ok=True)
+    # save_path.parent.mkdir(parents=True, exist_ok=True)
 
     # 取出 batch 0 的数据 (假设 test batch size 为 1)
     # [N, 3]

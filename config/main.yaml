@@ -89,6 +89,7 @@ test:
   using_depth_alignment: false
   using_rc_register: false
   using_mv_refinement: false
+  using_target_align: false
 
 seed: 111123
 

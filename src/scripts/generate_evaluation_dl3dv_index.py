@@ -68,48 +68,50 @@ def partition_list(lst, n_bins):
 def find_train_and_test_index(
     chunk_path,
     scene_name=None,
-    num_context_views=5,
-    num_target_skip=1,
-    num_target_views=28,
+    num_input_views=2,    # 对应你想要的 context 数量
+    num_predict_views=1,  # 对应你想要的 target 数量
     view_selection_num=-1,
 ):
-    global max_gap  # Declare using global variable
     chunk = torch.load(chunk_path)
     out_dict = OrderedDict()
+    
     for example in chunk:
         cur_scene_name = example["key"]
         if scene_name is not None and cur_scene_name != scene_name:
             continue
 
-        extrinsics, intrinsics = convert_poses(example["cameras"])
+        extrinsics, _ = convert_poses(example["cameras"])
         n_views = extrinsics.shape[0]
-        max_gap = max(max_gap, n_views)
-        # choose only the first n views for evaluation
-        # n_views = int(view_selection_num) if view_selection_num != -1 else n_views
+        
+        # 确定搜索范围
         n_views = min(n_views, int(view_selection_num)) if view_selection_num != -1 else n_views
 
-        index_context = sorted(
+        # 1. 采样“最具代表性/最偏”的视角作为【预测目标】
+        # 对应原代码逻辑：FPS 选出的其实是你的补全目标
+        predict_indices = sorted(
             farthest_point_sample(
-                extrinsics[:n_views, :3, -1].unsqueeze(0), num_context_views
-            )
-            .squeeze(0)
-            .tolist()
+                extrinsics[:n_views, :3, -1].unsqueeze(0), 
+                num_predict_views
+            ).squeeze(0).tolist()
         )
 
-        if num_target_views == -1:
-            index_target_all = [x for x in range(n_views)]
-            index_target = index_target_all
-        else:
-            index_target_all = [x for x in range(n_views) if x not in index_context]
-            index_target_select = partition_list(index_target_all, num_target_views)
-            if index_target_select is None:
-                continue
-            assert (
-                len(index_target_select) >= num_target_views
-            ), f"double check {cur_scene_name} at {chunk_path}: target len: {len(index_target_select)} from {len(index_target_all)}"
-            index_target = index_target_select[:num_target_views]
+        # 2. 从剩余视角中通过分桶选出【输入视角】
+        # 对应原代码逻辑：从非 FPS 点中选出支撑点
+        remaining_indices = [x for x in range(n_views) if x not in predict_indices]
+        input_indices = partition_list(remaining_indices, num_input_views)
+        
+        if input_indices is None:
+            continue
+            
+        # 仅取需要的数量，保持与原代码 partition_list[:n_tgt] 一致
+        input_indices = input_indices[:num_input_views]
 
-        out_dict[cur_scene_name] = {"context": index_target, "target": index_context}
+        # 3. 最终输出：保持 JSON 格式为 {"context": [输入], "target": [目标]}
+        # 这样写逻辑清晰，且结果与你之前的 JSON 完全相同
+        out_dict[cur_scene_name] = {
+            "context": input_indices,   # 这里的 input 对应你之前的 index_target
+            "target": predict_indices   # 这里的 predict 对应你之前的 index_context
+        }
 
     return out_dict
 
@@ -118,11 +120,9 @@ def generate_index_file(args):
     n_ctx = args.num_context_views
     n_tgt = args.num_target_views
 
-    if n_tgt == -1:
-        out_dir = f"assets/{args.type}_evaluation_video"
-    else:
-        out_dir = f"assets/{args.type}_ood"
+    out_dir = f"assets/{args.type}_extrapolation-test"
     os.makedirs(out_dir, exist_ok=True)
+    
     # data_dir = "datasets/DL3DV-10K-480/dl3dv_benchmark/test"
     data_dir = args.data_dir
     chunk_paths = sorted(glob(os.path.join(data_dir, "*.torch")))  # [:2]
@@ -130,9 +130,8 @@ def generate_index_file(args):
     for chunk_path in tqdm(chunk_paths):
         out_dict = find_train_and_test_index(
             chunk_path,
-            scene_name=None,
-            num_context_views=n_ctx,
-            num_target_views=n_tgt,
+            num_input_views=args.num_target_views,   # 传入 2
+            num_predict_views=args.num_context_views, # 传入 1
             view_selection_num=args.view_selection_num,
         )
         out_dict_all.update(out_dict)

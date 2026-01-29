@@ -78,6 +78,7 @@ class TestCfg:
     using_depth_alignment: bool
     using_rc_register: bool
     using_mv_refinement: bool
+    using_target_align: bool
 
 
 @dataclass

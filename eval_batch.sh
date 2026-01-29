@@ -2,61 +2,24 @@
 
 # 定义数组
 index_paths=(
-
-    # ood
-    "assets/dl3dv_ood/dl3dv_ctx_1v_tgt_2v_n10.json"
-    "assets/dl3dv_ood/dl3dv_ctx_1v_tgt_2v_n20.json"
-    "assets/dl3dv_ood/dl3dv_ctx_1v_tgt_2v_n30.json"
-    "assets/dl3dv_ood/dl3dv_ctx_1v_tgt_2v_n40.json"
-
-
-    # # old
-    # "assets/dl3dv_start_0_distance_10_ctx_2v_tgt_4v.json"
-    # "assets/dl3dv_start_0_distance_50_ctx_2v_video_0_50.json"
-    # "assets/dl3dv_start_0_distance_50_ctx_4v_video_0_50.json"
-    # "assets/dl3dv_start_0_distance_50_ctx_6v_video_0_50.json"
-    # "assets/dl3dv_evaluation/dl3dv_ctx_2v_tgt_4v_n100.json"
-    # "assets/dl3dv_evaluation/dl3dv_ctx_2v_tgt_4v_n150.json"
-    # "assets/dl3dv_evaluation/dl3dv_ctx_2v_tgt_4v_n200.json"
-    # "assets/dl3dv_evaluation/dl3dv_ctx_3v_tgt_56v.json"
-
-    # # MVSplat360
-    # "assets/dl3dv_evaluation/dl3dv_ctx_4v_tgt_56v.json"
-    # "assets/dl3dv_evaluation/dl3dv_ctx_5v_tgt_56v.json"
-    # "assets/dl3dv_evaluation/dl3dv_ctx_5v_tgt_56v_n150.json"
-    # "assets/dl3dv_evaluation/dl3dv_ctx_6v_tgt_56v.json"
-    # "assets/dl3dv_evaluation/dl3dv_ctx_7v_tgt_56v.json"
+    # eval-extrapolation
+    "assets/evaluation_index_extrapolation/dl3dv/dl3dv_ctx2_tgt1_n10.json"
+    "assets/evaluation_index_extrapolation/dl3dv/dl3dv_ctx2_tgt1_n20.json"
+    "assets/evaluation_index_extrapolation/dl3dv/dl3dv_ctx2_tgt1_n30.json"
+    "assets/evaluation_index_extrapolation/dl3dv/dl3dv_ctx2_tgt1_n40.json"
 )
 
 output_dirs=(
-
-    # ood
-    "new_experiments/12.20/hard-hole-mask-expand_1/dl3dv_ctx_1v_tgt_2v_n10"
-    "new_experiments/12.20/hard-hole-mask-expand_1/dl3dv_ctx_1v_tgt_2v_n20"
-    "new_experiments/12.20/hard-hole-mask-expand_1/dl3dv_ctx_1v_tgt_2v_n30"
-    "new_experiments/12.20/hard-hole-mask-expand_1/dl3dv_ctx_1v_tgt_2v_n40"
-
-    # # old
-    # "experiments/12.15/ours/dl3dv_start_0_distance_10_ctx_2v_tgt_4v"
-    # "experiments/12.15/ours/dl3dv_start_0_distance_50_ctx_2v_video_0_50"
-    # "experiments/12.15/ours/dl3dv_start_0_distance_50_ctx_4v_video_0_50"
-    # "experiments/12.15/ours/dl3dv_start_0_distance_50_ctx_6v_video_0_50"
-    # "experiments/12.15/ours/dl3dv_ctx_2v_tgt_4v_n100"
-    # "experiments/12.15/ours/dl3dv_ctx_2v_tgt_4v_n150"
-    # "experiments/12.15/ours/dl3dv_ctx_2v_tgt_4v_n200"
-    # "experiments/12.15/ours/mvsplat360/dl3dv_ctx_3v_tgt_56v"
-
-    # # MVSplat360
-    # "experiments/12.11/ours/mvsplat360/dl3dv_ctx_4v_tgt_56v"
-    # "experiments/12.10/ours/mvsplat360/dl3dv_ctx_5v_tgt_56v"
-    # "experiments/12.10/ours/mvsplat360/dl3dv_ctx_5v_tgt_56v_n150"
-    # "experiments/12.10/ours/mvsplat360/dl3dv_ctx_6v_tgt_56v"
-    # "experiments/12.10/ours/mvsplat360/dl3dv_ctx_7v_tgt_56v"
+    # eval-extrapolation
+    "outputs/1.23-1/batch-eval/dl3dv_ctx2_tgt1_n10"
+    "outputs/1.23-1/batch-eval/dl3dv_ctx2_tgt1_n20"
+    "outputs/1.23-1/batch-eval/dl3dv_ctx2_tgt1_n30"
+    "outputs/1.23-1/batch-eval/dl3dv_ctx2_tgt1_n40"
 )
 
 # gpus=(0)
 # gpus=(0 1 2 3 4 5 6 7)
-gpus=(0 1 2 3)
+gpus=(0 1)
 
 # 确保数组长度匹配
 if [ ${#index_paths[@]} -ne ${#output_dirs[@]} ]; then
@@ -64,14 +27,22 @@ if [ ${#index_paths[@]} -ne ${#output_dirs[@]} ]; then
     exit 1
 fi
 
+# 获取GPU总数
+num_gpus=${#gpus[@]}
+
 # 并行执行所有任务
-echo "启动 ${#index_paths[@]} 个任务..."
+echo "启动 ${#index_paths[@]} 个任务，使用 $num_gpus 个 GPU 循环分配..."
+
 for i in "${!index_paths[@]}"; do
-    gpu=${gpus[$i]}
+    # --- 修改开始: 循环计算 GPU 索引 ---
+    gpu_idx=$((i % num_gpus))
+    gpu=${gpus[$gpu_idx]}
+    # --- 修改结束 ---
+
     index_path="${index_paths[$i]}"
     output_dir="${output_dirs[$i]}"
     
-    echo "任务 $((i+1))/${#index_paths[@]}: GPU $gpu"
+    echo "任务 $((i+1))/${#index_paths[@]}: 分配到 GPU $gpu"
     echo "  index_path: $index_path"
     echo "  output_dir: $output_dir"
     
@@ -86,11 +57,22 @@ for i in "${!index_paths[@]}"; do
         model.encoder.monodepth_vit_type=vitb \
         checkpointing.pretrained_model="pretrained/depthsplat-gs-base-dl3dv-256x448-randview2-6-02c7b19d.pth" \
         output_dir="$output_dir" \
+        test.using_refinement=true \
         test.save_image=true \
         test.save_gt_image=true \
-        test.using_refinement=true &
-    
+        test.render_context=true \
+        test.using_stereo_anchor=true \
+        test.using_depth_alignment=true \
+        test.using_rc_register=true \
+        test.using_mv_refinement=true \
+        test.using_target_align=false \
+        hydra/job_logging=stdout \
+        hydra.output_subdir=null &
+        # test.using_refinement=true \
     pids[$i]=$!
+    
+    # 可选: 稍微等待几秒，防止并发启动时的冲突
+    sleep 1
 done
 
 # 等待所有任务完成
