@@ -391,16 +391,16 @@ class GaussianTTOOptimizer(nn.Module):
             rc_register_cost_time = time.time() - start_time
             print(f"====rc_register cost time {rc_register_cost_time}====")
 
-        ## [DEBUG]
-        anchor_out = decoder(merged_gaussians, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], target_render_pkg['near'], target_render_pkg['far'], (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
-        anchor_depth_vis = visualize_depth(anchor_out.depth[0][0], cmap_name='Spectral')
-        save_image(anchor_depth_vis, "outputs/1.28/anchor_depth_vis.png")
+        # ## [DEBUG]
+        # anchor_out = decoder(merged_gaussians, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], target_render_pkg['near'], target_render_pkg['far'], (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
+        # anchor_depth_vis = visualize_depth(anchor_out.depth[0][0], cmap_name='Spectral')
+        # save_image(anchor_depth_vis, "outputs/1.28/anchor_depth_vis.png")
         
-        target_out = decoder(merged_gaussians, anchor_extrinsics, anchor_intrinsics, anchor_near, anchor_far, (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
-        target_depth_vis = visualize_depth(target_out.depth[0][0], cmap_name='Spectral')
-        save_image(target_depth_vis, "outputs/1.28/target_depth_vis.png")
+        # target_out = decoder(merged_gaussians, anchor_extrinsics, anchor_intrinsics, anchor_near, anchor_far, (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
+        # target_depth_vis = visualize_depth(target_out.depth[0][0], cmap_name='Spectral')
+        # save_image(target_depth_vis, "outputs/1.28/target_depth_vis.png")
 
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
         with torch.no_grad():
             final_means_s1 = cam_center + opt_dists.detach() * ray_dirs 
             target_gaussians.means = final_means_s1.unsqueeze(0).detach()
@@ -413,10 +413,9 @@ class GaussianTTOOptimizer(nn.Module):
         
         # [Config] Set to True to use dilation (Mask Dilation), False for raw mask
         use_mask_dilation = True 
-
+        assert hole_tags is not None, "Hole mask must be here for dilation."
         if use_mask_dilation:
             # --- Strategy A: Hard Hole Filter with Dilation ---
-            assert hole_tags is not None, "Hole mask must be here for dilation."
             H, W = target_render_pkg['h'], target_render_pkg['w']
             hole_mask_2d = hole_tags.view(1, 1, H, W).float()
             dilation_radius = 3 
@@ -431,12 +430,9 @@ class GaussianTTOOptimizer(nn.Module):
         
         else:
             # --- Strategy B: Simple Hard Hole Filter ---
-            if hole_tags is not None: 
-                keep_mask = hole_tags.to(device)
-                if keep_mask.dtype != torch.bool:
-                    keep_mask = keep_mask > 0.5
-            else: 
-                keep_mask = torch.ones(final_means_s1.shape[0], dtype=torch.bool, device=device)
+            keep_mask = hole_tags.to(device)
+            if keep_mask.dtype != torch.bool:
+                keep_mask = keep_mask > 0.5
             
             print(f"  [TTO Stage 2-Filter] Using raw mask without dilation.")
 
@@ -599,14 +595,14 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
         self.rotation_weight = 1.0
         self.translation_weight = 1.0
         
-        # print("Loading PE Pipeline (from ~/code/pe_field)...")
-        # external_pe_root = os.path.expanduser("~/gaoao/code")
-        # if external_pe_root not in sys.path:
-        #     sys.path.insert(0, external_pe_root)
+        print("Loading PE Pipeline (from ~/code/pe_field)...")
+        external_pe_root = os.path.expanduser("~/gaoao/code")
+        if external_pe_root not in sys.path:
+            sys.path.insert(0, external_pe_root)
             
-        # import pe_field
-        # from pe_field.pipeline_pe_field import PEFieldPipeline
-        # self.pe_field = PEFieldPipeline()
+        import pe_field
+        from pe_field.pipeline_pe_field import PEFieldPipeline
+        self.pe_field = PEFieldPipeline()
 
         self.tto_optimizer = GaussianTTOOptimizer()
 
@@ -701,7 +697,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                 
                 # Calculate assignments
                 nearest_assignments = self.find_nearest_assignments(current_ctx_extrinsics, current_tgt_extrinsic)
-                stereo_assignments = self.find_stereo_assignments(current_ctx_extrinsics, current_tgt_extrinsic)
+                stereo_assignments = self.find_stereo_assignments(current_ctx_extrinsics, current_tgt_extrinsic, max_angle_deg=45.0)
                 stereo_match_idx = int(stereo_assignments[0])
                 nearest_match_idx = int(nearest_assignments[0])
                 difix_anchor_idx = nearest_match_idx 
@@ -784,13 +780,14 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                     "extrinsics": target_extrinsic
                 }
                 print(f"Generating view {View_id} using PE-Field (Anchor {difix_anchor_idx})...")
-                # fixed_image_tensor, phi, theta, warped_image_tensor = self.pe_field(
-                #     context=pe_ctx, 
-                #     target=pe_tgt, 
-                #     num_inference_steps=4,
-                #     debug=False,
-                # )
-                fixed_image_tensor = extra_context["image"][:, i]
+                fixed_image_tensor, phi, theta, warped_image_tensor = self.pe_field(
+                    context=pe_ctx, 
+                    target=pe_tgt, 
+                    num_inference_steps=4,
+                    debug=False,
+                )
+                ## DEBUG
+                # fixed_image_tensor = extra_context["image"][:, i]
                 pe_field_cost_time = time.time() - start_time
                 print(f"====pe_field cost time {pe_field_cost_time}====")
 
@@ -853,8 +850,9 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                 target_gaussians = self._slice_gaussians_views(res_pair["gaussians"], [1])
                 target_gaussians = self._flatten_and_merge_gaussians([target_gaussians], batch_size=1)
 
+                ## DEBUG
                 # # save_gaussian_ply(target_gaussians, None, None, "165f5af8bfe32f70595a1c9393a6e442acf7af019998275144f605b89a306557-1.ply")
-                save_gaussian_ply(target_gaussians, None, None, "outputs/1.28/0bfdd020cf475b9c68e4b469d1d1a2d0cad303eefe8b78fb2307855afdaac8be.ply")
+                # # save_gaussian_ply(target_gaussians, None, None, "outputs/1.28/0bfdd020cf475b9c68e4b469d1d1a2d0cad303eefe8b78fb2307855afdaac8be.ply")
 
                 anchor_pred_depth = res_pair["depths"][:, 0] 
                 target_pred_depth = res_pair["depths"][:, 1] 
