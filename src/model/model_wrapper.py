@@ -72,6 +72,7 @@ class TestCfg:
     save_depth_concat_img: bool
     save_depth_npy: bool
     save_gaussian: bool
+    save_colmap: bool
     render_chunk_size: int | None
     stablize_camera: bool
     stab_camera_kernel: int
@@ -80,6 +81,7 @@ class TestCfg:
     using_rc_register: bool
     using_mv_refinement: bool
     using_target_align: bool
+    angle_deg: float
 
 
 @dataclass

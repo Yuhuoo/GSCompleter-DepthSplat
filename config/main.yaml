@@ -79,6 +79,7 @@ test:
   save_input_images: false
   save_depth: false
   save_virtual_video: false
+  save_colmap: false
   using_refinement: false
   save_depth_npy: false
   save_depth_concat_img: false
@@ -91,6 +92,7 @@ test:
   using_rc_register: false
   using_mv_refinement: false
   using_target_align: false
+  angle_deg: 45.0
 
 seed: 111123
 

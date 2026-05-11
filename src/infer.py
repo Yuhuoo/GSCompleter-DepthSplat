@@ -220,6 +220,7 @@ def inference(cfg_dict: DictConfig):
     using_rc_register = cfg.test.using_rc_register
     using_mv_refinement = cfg.test.using_mv_refinement
     using_target_align = cfg.test.using_target_align
+    angle_deg = cfg.test.angle_deg
 
     output_dir = Path(cfg_dict.output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -286,6 +287,9 @@ def inference(cfg_dict: DictConfig):
         #     continue
 
         # if scene != "165f5af8bfe32f70595a1c9393a6e442acf7af019998275144f605b89a306557":
+        #     continue
+
+        # if scene != "ff592398657b3dfe94153332861985194a3e3c9d199c4a3a27a0ce4038e81ade":
         #     continue
 
         # # 将 ID 提取为常量集合 (Set)，自动去重且查询速度更快 (O(1))
@@ -394,6 +398,7 @@ def inference(cfg_dict: DictConfig):
                 using_rc_register=using_rc_register,
                 using_mv_refinement=using_mv_refinement,
                 using_target_align=using_target_align,
+                angle_deg=angle_deg,
             )
             if isinstance(gaussians, dict):
                 pred_depths = gaussians["depths"]
@@ -487,10 +492,11 @@ def inference(cfg_dict: DictConfig):
                     for idx, color in zip(batch["context"]["index"][0], context_images_prob[0]):
                         save_image(color, ctx_dir / f"{idx:0>6}.png")
 
-            # 保存colmap (可选)
-            colmap_sparse_dir = output_dir / "colmap_data" / scene / "sparse" / "0"
-            h, w = batch["target"]["image"].shape[-2:]
-            save_colmap_structure(batch, extra_context, colmap_sparse_dir, h, w, gaussians)
+            if cfg.test.save_colmap:
+                # 保存colmap (可选)
+                colmap_sparse_dir = output_dir / "colmap_data" / scene / "sparse" / "0"
+                h, w = batch["target"]["image"].shape[-2:]
+                save_colmap_structure(batch, extra_context, colmap_sparse_dir, h, w, gaussians)
 
         # --- Depth Export ---
         if cfg.test.save_depth:
@@ -539,6 +545,8 @@ def inference(cfg_dict: DictConfig):
             # 如果计算失败，可以在结果里记一个 -1 或者跳过
             final_results["fid"] = -1.0 
 
+    print(f"Fallback_cnt:{encoder._cnt_fallback}")
+
     # --- 4. 保存 Benchmark JSON ---
     benchmarker.dump(metrics_dir / "benchmark.json")
     
@@ -557,6 +565,8 @@ def inference(cfg_dict: DictConfig):
         # 这里会遍历 final_results 字典，因为上面已经把 fid 存进去了，所以会自动写进去
         for k, v in final_results.items():
             f.write(f"{k}: {v:.4f}\n")
+
+        f.write(f"Fallback_cnt:{encoder._cnt_fallback}")
 
     # --- 6. 源代码备份 ---
     backup_dir = output_dir / "backup"

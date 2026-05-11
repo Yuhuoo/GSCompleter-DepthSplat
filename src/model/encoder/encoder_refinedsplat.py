@@ -269,7 +269,8 @@ class GaussianTTOOptimizer(nn.Module):
                 using_rc_register: bool = False,
                 using_mv_refinement: bool = False,
                 monster_indices: torch.Tensor = None,
-                enable_opacity_baking: bool = False):
+                enable_opacity_baking: bool = False,
+                debug_dir: str = None,):
         
         device = target_gaussians.means.device
 
@@ -427,7 +428,15 @@ class GaussianTTOOptimizer(nn.Module):
             keep_mask = (dilated_hole_mask.view(-1) > 0.5)
             
             print(f"  [TTO Stage 2-Filter Mask Dilation] Original Hole: {hole_tags.sum()} -> Dilated Hole (+{dilation_radius}px): {keep_mask.sum()} pixels.")
-        
+
+            mask_vis = hole_mask_2d.float().cpu().squeeze()
+            if mask_vis.dim() == 2: mask_vis = mask_vis.unsqueeze(0).repeat(3, 1, 1)
+            save_image(mask_vis, os.path.join(debug_dir, f"view_hole_mask.png"))
+            
+            mask_vis = dilated_hole_mask.float().cpu().squeeze()
+            if mask_vis.dim() == 2: mask_vis = mask_vis.unsqueeze(0).repeat(3, 1, 1)
+            save_image(mask_vis, os.path.join(debug_dir, f"view_dilated_hole_mask.png"))
+
         else:
             # --- Strategy B: Simple Hard Hole Filter ---
             keep_mask = hole_tags.to(device)
@@ -606,6 +615,9 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
 
         self.tto_optimizer = GaussianTTOOptimizer()
 
+        # 统计回退
+        self._cnt_fallback = 0
+
     # [CODE RETAINED BUT UNUSED] Helper to detect monsters
     def _detect_monsters(self, radii, threshold=None):
         if threshold is None:
@@ -642,6 +654,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
         using_rc_register: bool = False,
         using_mv_refinement: bool = False,
         return_time: bool = False,
+        angle_deg: float = 45.0,
     ):
         _, _, _, h, w = context["image"].shape
         device = context["image"].device
@@ -697,7 +710,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                 
                 # Calculate assignments
                 nearest_assignments = self.find_nearest_assignments(current_ctx_extrinsics, current_tgt_extrinsic)
-                stereo_assignments = self.find_stereo_assignments(current_ctx_extrinsics, current_tgt_extrinsic, max_angle_deg=45.0)
+                stereo_assignments = self.find_stereo_assignments(current_ctx_extrinsics, current_tgt_extrinsic, max_angle_deg=angle_deg)
                 stereo_match_idx = int(stereo_assignments[0])
                 nearest_match_idx = int(nearest_assignments[0])
                 difix_anchor_idx = nearest_match_idx 
@@ -929,7 +942,8 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                         using_rc_register=using_rc_register,
                         using_mv_refinement=using_mv_refinement,
                         monster_indices=None,
-                        enable_opacity_baking=False 
+                        enable_opacity_baking=False,
+                        debug_dir=debug_dir 
                     )
 
                     num_gaussians = refined_target_gaussians.means.shape[1]
@@ -1112,6 +1126,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                 # 这种情况下通常选角度最小的
                 candidates.sort(key=lambda x: x["angle"])
                 assignments.append(candidates[0]["idx"])
+                self._cnt_fallback += 1
                 print(f"  [Warning] Target {j} has no overlapping context (Min Angle: {candidates[0]['angle']:.1f}°). Fallback to min angle.")
 
         return assignments
