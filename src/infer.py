@@ -17,7 +17,7 @@ from omegaconf import DictConfig
 from colorama import Fore
 from jaxtyping import install_import_hook
 from PIL import Image
-from einops import rearrange
+from einops import rearrange, repeat
 
 from torchmetrics.image.fid import FrechetInceptionDistance
 
@@ -45,6 +45,29 @@ from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 from plyfile import PlyData, PlyElement
 from PIL import Image
+
+# ================= 新增功能：生成环绕虚拟视角位姿 =================
+def generate_orbit_poses(c2w: torch.Tensor, radius: float = 0.15, n_frames: int = 40):
+    """
+    围绕给定的 c2w 位姿构造一圈虚拟视角
+    """
+    device = c2w.device
+    R_orig = c2w[:3, :3]  # [3, 3]
+    t_orig = c2w[:3, 3]   # [3]
+    angles = torch.linspace(0, 2 * math.pi, n_frames, device=device)
+    
+    # 在相机局部坐标系的 XY 平面生成圆环偏移
+    dx = torch.cos(angles) * radius
+    dy = torch.sin(angles) * radius
+    offsets_local = torch.stack([dx, dy, torch.zeros_like(angles)], dim=-1) # [N, 3]
+    
+    # 转换到世界坐标系
+    offsets_world = torch.einsum('ij, nj -> ni', R_orig, offsets_local) 
+    
+    # 构造位姿序列
+    virtual_c2ws = repeat(c2w, 'i j -> n i j', n=n_frames).clone()
+    virtual_c2ws[:, :3, 3] = t_orig + offsets_world
+    return virtual_c2ws
 
 def save_colmap_structure(batch, extra_context, sparse_dir, height, width, gaussians=None):
     """
@@ -259,8 +282,8 @@ def inference(cfg_dict: DictConfig):
 
         (scene,) = batch["scene"]
 
-        if scene != "0bfdd020cf475b9c68e4b469d1d1a2d0cad303eefe8b78fb2307855afdaac8be":
-            continue
+        # if scene != "0bfdd020cf475b9c68e4b469d1d1a2d0cad303eefe8b78fb2307855afdaac8be":
+        #     continue
 
         # if scene != "165f5af8bfe32f70595a1c9393a6e442acf7af019998275144f605b89a306557":
         #     continue
@@ -428,6 +451,28 @@ def inference(cfg_dict: DictConfig):
                     test_step_outputs["ctx_psnr"].append(compute_psnr(rgb_context_gt, context_images_prob[0]).mean().item())
                     test_step_outputs["ctx_ssim"].append(compute_ssim(rgb_context_gt, context_images_prob[0]).mean().item())
                     test_step_outputs["ctx_lpips"].append(compute_lpips(rgb_context_gt, context_images_prob[0]).mean().item())
+
+            # === 修正部分：虚拟视角环绕视频生成 ===
+            if cfg.test.save_virtual_video:
+
+                base_c2w = batch["target"]["extrinsics"][0, 0]
+                base_k = batch["target"]["intrinsics"][0, 0]
+                orbit_c2ws = generate_orbit_poses(base_c2w, radius=0.15, n_frames=40)
+                
+                orbit_frames = []
+                for i in range(len(orbit_c2ws)):
+                    curr_c2w = orbit_c2ws[i:i+1].unsqueeze(0) # [1, 1, 4, 4]
+                    v_out = decoder.forward(
+                        gaussians, curr_c2w, base_k.view(1, 1, 3, 3), 
+                        batch["target"]["near"][:, :1], batch["target"]["far"][:, :1], (h, w)
+                    )
+                    # 将渲染结果加入列表 [3, H, W]
+                    orbit_frames.append(v_out.color[0, 0].clamp(0, 1).cpu())
+
+                scene_vid_dir = output_dir / "videos-frames" / scene / "color"
+                scene_vid_dir.mkdir(parents=True, exist_ok=True)
+                for idx, color in enumerate(orbit_frames):
+                    save_image(color, scene_vid_dir / f"{idx:0>6}.png")
 
             # 保存图像
             if cfg.test.save_image:

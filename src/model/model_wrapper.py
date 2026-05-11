@@ -67,6 +67,7 @@ class TestCfg:
     render_context: bool
     save_input_images: bool
     save_depth: bool
+    save_virtual_video: bool
     using_refinement: bool
     save_depth_concat_img: bool
     save_depth_npy: bool
