@@ -11,20 +11,20 @@ COMMON_ARGS="+experiment=dl3dv mode=test \
     model.encoder.lowest_feature_resolution=8 \
     model.encoder.monodepth_vit_type=vitb \
     checkpointing.pretrained_model=pretrained/depthsplat-gs-base-dl3dv-256x448-randview2-6-02c7b19d.pth \
-    test.save_virtual_video=false \
+    test.save_virtual_video=true \
     test.save_image=true \
     test.save_gt_image=true \
     test.render_context=true \
     test.save_colmap=false"
 
 # 基础输出路径
-BASE_OUT="outputs/5.11/visible_seams_addressing"
-SUB_DIR="dl3dv_ctx2_tgt1_n10_wo_dilation"
+BASE_OUT="outputs-5-14/ablation_study-3"
+SUB_DIR="dl3dv_ctx2_tgt1_n10_w_dilation"
 
 # 2. 定义实验配置数组
-# 格式: "GPU_ID | 实验名 | using_refinement | using_stereo_anchor | using_depth_alignment | using_rc_register | using_mv_refinement | using_target_align | angle_deg"
+# 格式: "GPU_ID | 实验名 | using_refinement | using_stereo_anchor | using_depth_alignment | using_rc_register | using_mv_refinement | using_target_align"
 experiments=(
-    # "0 | baseline         | false | false | false | false | false | false"
+    "0 | baseline         | false | false | false | false | false | false"
     # "1 | ours-all         | true  | true  | true  | true  | true  | false"
     # "2 | ours-wo-sa       | true  | false | true  | true  | true  | false"
     # "3 | ours-wo-da       | true  | true  | false | true  | true  | false"
@@ -33,9 +33,6 @@ experiments=(
     # "6 | ours-wo-mv       | true  | true  | true  | true  | false | false"
     # "7 | ours-wo-all       | true  | false  | false | false | false  | false"
     # "7 | ours-tgt-align   | true  | true  | true  | true  | true | true"
-    # "0 | ours-30   | true  | true  | true  | true  | true  | false | 30.0"
-    "0 | ours-45   | true  | true  | true  | true  | true  | false | 45.0"
-    # "0 | ours-90   | true  | true  | true  | true  | true  | false | 90.0"
 )
 
 echo "开始并行实验任务..."
@@ -43,7 +40,7 @@ echo "开始并行实验任务..."
 # 3. 循环遍历并启动后台进程
 for exp in "${experiments[@]}"; do
     # 解析数组行（使用 IFS 分隔符）
-    IFS='|' read -r gpu name re sa da rc mv ta ad <<< "$exp"
+    IFS='|' read -r gpu name re sa da rc mv ta<<< "$exp"
     
     # 去除首尾空格
     gpu=$(echo $gpu | xargs)
@@ -54,7 +51,6 @@ for exp in "${experiments[@]}"; do
     rc=$(echo $rc | xargs)
     mv=$(echo $mv | xargs)
     ta=$(echo $ta | xargs)
-    ad=$(echo $ad | xargs)
 
     echo "[GPU $gpu] 启动实验: $name"
 
@@ -67,7 +63,6 @@ for exp in "${experiments[@]}"; do
         test.using_rc_register=$rc \
         test.using_mv_refinement=$mv \
         test.using_target_align=$ta \
-        test.angle_deg=$ad \
         hydra/job_logging=stdout \
         hydra.output_subdir=null &
 done

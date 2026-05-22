@@ -283,90 +283,7 @@ def inference(cfg_dict: DictConfig):
 
         (scene,) = batch["scene"]
 
-        # if scene != "0bfdd020cf475b9c68e4b469d1d1a2d0cad303eefe8b78fb2307855afdaac8be":
-        #     continue
 
-        # if scene != "165f5af8bfe32f70595a1c9393a6e442acf7af019998275144f605b89a306557":
-        #     continue
-
-        # if scene != "ff592398657b3dfe94153332861985194a3e3c9d199c4a3a27a0ce4038e81ade":
-        #     continue
-
-        # # 将 ID 提取为常量集合 (Set)，自动去重且查询速度更快 (O(1))
-        # MIDDLE_CASE_SCENES = {
-        #     # 第一组
-        #     "0beae06611ead92b", "0e2653d00e3fc05a", "0f540553fc30f16d",
-        #     "1a8ece21a2ad0452", "0be9a0dcbfe032f1", "0c11dbe781b1c11c",
-        #     "0c209edeb7637dff", "0d0f4080d36dfc68", "0d4de33c6888a754",
-        #     "0e16d64d961fe855", "0ecf489d873b7f52", "0f61837b9749da34",
-        #     "0f2197967bb7fa43",
-
-        #     # 第二组 (已去除重复项)
-        #     "fb424ab019f3e1a1", "fb77aac44a45a28f", "f673068196024955",
-        #     "fb32e6765f776b18", "fb08b3c2668c99c3", "fa71d84898d6ac7f",
-        #     "fa89b06ee36da59f", "fa25ffc4897fc142"
-        # }
-
-        # RE10K_SCENE = {
-        #     "fb32e6765f776b18", 
-        #     "fb77aac44a45a28f",
-        #     "0aa284f8166e19e4",
-        #     "0e2f2538b26a179c",
-        #     "1a8ece21a2ad0452",
-        #     "f673068196024955",
-        #     "fa25ffc4897fc142",
-        #     "fb424ab019f3e1a1",
-        #     "0be9a0dcbfe032f1",
-        #     "0c11dbe781b1c11c",
-        #     "0ecf489d873b7f52",
-        #     "0f540553fc30f16d",
-        #     "fa71d84898d6ac7f",
-        # }
-
-        # ACID_SCENE = {
-        #     "1f2094f9c3bc8b80", "3c5b3301a6447b1d", "3e9d7d1a812006e8",
-        #     "3e88f9a1bc066559", "3f25d88082b2184d", "4abfbb2335a8bdef",
-        #     "4b8c8a512a2f1897", "4b86e20268277098", "5bf5bdc1589542f0",
-        #     "5d4d7b4211a6696a", "5ebe8a8504e5fe5c", "5fe00e4343dbea87"
-        # }
-
-        # ACID_SCENE = ["3fb182069789a407", "4b7cbabaeacf7513", "4bd7e38befc26859",
-        #                 "4c502f7050f56932", "4d15bbd24aca6c34", "4e87b6169c9b092b",
-        #                 "4e9534eca92a77c1", "4fed525f15343c50", "5bf58752f57ed57f",
-        # ]
-
-        # ACID_SCENE = {
-        #     # 包含所有数据
-        #     "ffbefe4d58cc142c", "f15270b478bbd0b6", "f51d8789db1f722c",
-        #     "f33cad5fe9bd65f9", "f7f7b65716d33d83", "f7bf32621bfaa258",
-        #     "f01b935b1dd0b8fc", "efc467d31f45cf25", "ee09e048af8deba6",
-        #     "ed9373747151baee", "ecad96c59526d45f", "eb8596da8ffc2252",
-        #     "ea36b0ce652cd8b4", "e76982afe8dec0cd", "e9828e82fe988c70",
-        #     "e614b4670c543a72", "e98e20a610fb4ab7", "e38f448615d145d0",
-        #     "df93cf79e9069eb7", "dcdd7a4e285e7e4a", "dcc8e9a3ec4195e1"
-        # }
-
-        # # 逻辑判断
-        # # middle case
-        # if scene not in ACID_SCENE:
-        #     continue
-
-        # well_case
-        # if scene not in [
-        #     "0aa284f8166e19e4",
-        #     "0b1b293ffb0e2f51",
-        #     "0bd819cb30a432c6",
-        #     "00beb03ef95dc637",
-        #     "0c3d3b45ff4a4326",
-        #     "0c9ea3bf67254e95",
-        #     "0d22ced53b1db7d3",
-        #     "0de78cb98105f8c2",
-        #     "0df123f66dbcd774",
-        #     "0e1a7abc82b1afb2",
-        #     "0e2f2538b26a179c",
-        #     "0f18fb6736efb1c2"
-        # ]:
-        #     continue
 
         b, v, _, h, w = batch["target"]["image"].shape
         visualization_dump = {} if (cfg.test.save_depth or cfg.test.save_gaussian) else None
@@ -423,26 +340,20 @@ def inference(cfg_dict: DictConfig):
             rgb_gt = batch["target"]["image"][0] # [V, 3, H, W]
 
             if cfg.test.compute_scores:
-                # Target 视角
+
                 test_step_outputs["psnr"].append(compute_psnr(rgb_gt, images_prob[0]).mean().item())
                 test_step_outputs["ssim"].append(compute_ssim(rgb_gt, images_prob[0]).mean().item())
                 test_step_outputs["lpips"].append(compute_lpips(rgb_gt, images_prob[0]).mean().item())
-                
-                # === 新增：累积 FID 统计量 ===
-                # 注意：images_prob[0] 是 [V, 3, H, W]，值范围 [0, 1]
-                # FID metric 要求 uint8 [0, 255]
-                # .detach() 很重要，防止梯度图导致显存爆炸
+
                 fake_imgs = torch.clamp(images_prob[0].detach(), 0, 1)
                 real_imgs = torch.clamp(rgb_gt.detach(), 0, 1)
                 
                 fake_imgs_uint8 = (fake_imgs * 255).to(dtype=torch.uint8)
                 real_imgs_uint8 = (real_imgs * 255).to(dtype=torch.uint8)
-                
-                # 更新 FID (real=True 存真实分布, real=False 存生成分布)
+
                 fid_metric.update(real_imgs_uint8, real=True)
                 fid_metric.update(fake_imgs_uint8, real=False)
 
-                # Context 视角
                 if cfg.test.render_context:
                     with benchmarker.time("decoder_context"):
                         context_output = decoder.forward(
@@ -457,7 +368,6 @@ def inference(cfg_dict: DictConfig):
                     test_step_outputs["ctx_ssim"].append(compute_ssim(rgb_context_gt, context_images_prob[0]).mean().item())
                     test_step_outputs["ctx_lpips"].append(compute_lpips(rgb_context_gt, context_images_prob[0]).mean().item())
 
-            # === 修正部分：虚拟视角环绕视频生成 ===
             if cfg.test.save_virtual_video:
 
                 base_c2w = batch["target"]["extrinsics"][0, 0]
@@ -471,7 +381,6 @@ def inference(cfg_dict: DictConfig):
                         gaussians, curr_c2w, base_k.view(1, 1, 3, 3), 
                         batch["target"]["near"][:, :1], batch["target"]["far"][:, :1], (h, w)
                     )
-                    # 将渲染结果加入列表 [3, H, W]
                     orbit_frames.append(v_out.color[0, 0].clamp(0, 1).cpu())
 
                 scene_vid_dir = output_dir / "videos-frames" / scene / "color"
@@ -479,7 +388,6 @@ def inference(cfg_dict: DictConfig):
                 for idx, color in enumerate(orbit_frames):
                     save_image(color, scene_vid_dir / f"{idx:0>6}.png")
 
-            # 保存图像
             if cfg.test.save_image:
                 for idx, color in zip(batch["target"]["index"][0], images_prob[0]):
                     save_image(color, output_dir / "images" / scene / f"color/{idx:0>6}.png")
@@ -493,7 +401,6 @@ def inference(cfg_dict: DictConfig):
                         save_image(color, ctx_dir / f"{idx:0>6}.png")
 
             if cfg.test.save_colmap:
-                # 保存colmap (可选)
                 colmap_sparse_dir = output_dir / "colmap_data" / scene / "sparse" / "0"
                 h, w = batch["target"]["image"].shape[-2:]
                 save_colmap_structure(batch, extra_context, colmap_sparse_dir, h, w, gaussians)
@@ -508,16 +415,13 @@ def inference(cfg_dict: DictConfig):
                 save_path.parent.mkdir(parents=True, exist_ok=True)
                 Image.fromarray(depth_viz).save(save_path)
 
-    # 6. 汇总与备份 (Finalizing Metrics)
     print(cyan("\nFinalizing Metrics..."))
-    
-    # --- 1. 汇总几何指标 (如果有 TTO) ---
+
     tto_opt = getattr(encoder, "tto_optimizer", None)
     geometry_summary = ""
     if tto_opt and hasattr(tto_opt, "evaluator"):
         geometry_summary = tto_opt.evaluator.summarize(save_path=str(output_dir / "geometry_metrics.txt"))
 
-    # --- 2. 汇总图像指标 (PSNR, SSIM, LPIPS) ---
     final_results = {}
     for metric, scores in test_step_outputs.items():
         if scores:
@@ -525,50 +429,41 @@ def inference(cfg_dict: DictConfig):
             final_results[metric] = avg_score
             print(f"{metric.upper()}: {avg_score:.4f}")
 
-    # --- 3. 计算并汇总 FID (新增部分) ---
     if cfg.test.compute_scores:
         try:
             print("Computing FID... (This may take a while depending on VRAM/Dataset size)")
-            # compute() 返回的是 tensor，需要转为 float (.item())
+
             fid_score = fid_metric.compute()
             fid_value = fid_score.item()
             
             print(f"FID: {fid_value:.4f}")
-            
-            # 【关键点】将 FID 加入到最终结果字典中，以便稍后写入 txt
+
             final_results["fid"] = fid_value
-            
-            # 计算完后清理显存
+
             fid_metric.reset()
         except Exception as e:
             print(f"{Fore.RED}Failed to compute FID (possibly too few samples or OOM): {e}{Fore.RESET}")
-            # 如果计算失败，可以在结果里记一个 -1 或者跳过
             final_results["fid"] = -1.0 
 
     print(f"Fallback_cnt:{encoder._cnt_fallback}")
 
-    # --- 4. 保存 Benchmark JSON ---
     benchmarker.dump(metrics_dir / "benchmark.json")
-    
-    # --- 5. 写入 metrics_summary.txt (包含 FID) ---
+
     summary_path = output_dir / "metrics_summary.txt"
     print(f"Saving metrics summary to {summary_path}")
     
     with open(summary_path, "w") as f:
         f.write("Final Report\n")
         f.write("====================\n")
-        # 写入几何指标
+
         if geometry_summary:
             f.write(f"{geometry_summary}\n")
-        
-        # 写入图像指标 (PSNR, SSIM, LPIPS, FID)
-        # 这里会遍历 final_results 字典，因为上面已经把 fid 存进去了，所以会自动写进去
+
         for k, v in final_results.items():
             f.write(f"{k}: {v:.4f}\n")
 
         f.write(f"Fallback_cnt:{encoder._cnt_fallback}")
 
-    # --- 6. 源代码备份 ---
     backup_dir = output_dir / "backup"
     backup_dir.mkdir(exist_ok=True)
     if os.path.exists("src/model/encoder/encoder_refinedsplat.py"):
