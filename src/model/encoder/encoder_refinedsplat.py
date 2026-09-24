@@ -650,6 +650,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
         decoder = None, 
         using_target_align: bool = False,
         using_stereo_anchor: bool = False,
+        using_gscompleter: bool = False,
         using_depth_alignment: bool = False,
         using_rc_register: bool = False,
         using_mv_refinement: bool = False,
@@ -918,33 +919,37 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                     tgt_far = extra_context["far"][:, i:i+1]
                     tgt_index = extra_context["index"][:, i:i+1]
 
-                    target_render_pkg = {
-                        "extrinsics": tgt_extrinsics, 
-                        "intrinsics": tgt_intrinsics,
-                        "near": tgt_near, 
-                        "far": tgt_far,
-                        "image": fixed_image_tensor,
-                        "depth": aligned_dense_depth.unsqueeze(1),
-                        "hole_mask": tgt_hole_mask[0, 0],
-                        "sparse_gt_depth": tgt_sparse_depth,
-                        "sparse_valid_mask": tgt_valid_mask,
-                        "h": h, "w": w
-                    }
-                    
-                    refined_target_gaussians = self.tto_optimizer(
-                        decoder=decoder, 
-                        target_gaussians=target_gaussians, 
-                        context_gaussians=flat_context_gaussians, 
-                        context_render_pkg=context_render_pkg, 
-                        target_render_pkg=target_render_pkg,
-                        hole_tags=hole_tags,
-                        stereo_anchor_idx=stereo_anchor_idx,
-                        using_rc_register=using_rc_register,
-                        using_mv_refinement=using_mv_refinement,
-                        monster_indices=None,
-                        enable_opacity_baking=False,
-                        debug_dir=debug_dir 
-                    )
+                    if using_gscompleter:
+                        target_render_pkg = {
+                            "extrinsics": tgt_extrinsics,
+                            "intrinsics": tgt_intrinsics,
+                            "near": tgt_near,
+                            "far": tgt_far,
+                            "image": fixed_image_tensor,
+                            "depth": aligned_dense_depth.unsqueeze(1),
+                            "hole_mask": tgt_hole_mask[0, 0],
+                            "sparse_gt_depth": tgt_sparse_depth,
+                            "sparse_valid_mask": tgt_valid_mask,
+                            "h": h, "w": w
+                        }
+
+                        refined_target_gaussians = self.tto_optimizer(
+                            decoder=decoder,
+                            target_gaussians=target_gaussians,
+                            context_gaussians=flat_context_gaussians,
+                            context_render_pkg=context_render_pkg,
+                            target_render_pkg=target_render_pkg,
+                            hole_tags=hole_tags,
+                            stereo_anchor_idx=stereo_anchor_idx,
+                            using_rc_register=using_rc_register,
+                            using_mv_refinement=using_mv_refinement,
+                            monster_indices=None,
+                            enable_opacity_baking=False,
+                            debug_dir=debug_dir
+                        )
+                    else:
+                        print("ablation study: generated content only (skip GSCompleter TTO).")
+                        refined_target_gaussians = target_gaussians
 
                     num_gaussians = refined_target_gaussians.means.shape[1]
                     print(f"*************Update {num_gaussians} gaussians to map*************")

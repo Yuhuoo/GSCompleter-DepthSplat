@@ -11,6 +11,7 @@ model.encoder.monodepth_vit_type=vitb \
 checkpointing.pretrained_model=pretrained/depthsplat-gs-base-dl3dv-256x448-randview2-6-02c7b19d.pth \
 output_dir=outputs/1.16/long_seq/dl3dv_ctx_0_20_tgt_every_20 \
 test.using_refinement=true \
+test.using_gscompleter=true \
 test.save_image=true \
 test.save_gt_image=true \
 test.render_context=true \

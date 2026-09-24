@@ -77,6 +77,7 @@ class TestCfg:
     stablize_camera: bool
     stab_camera_kernel: int
     using_stereo_anchor: bool
+    using_gscompleter: bool
     using_depth_alignment: bool
     using_rc_register: bool
     using_mv_refinement: bool

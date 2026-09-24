@@ -216,6 +216,7 @@ def inference(cfg_dict: DictConfig):
 
     # Ablation study
     using_stereo_anchor = cfg.test.using_stereo_anchor
+    using_gscompleter = cfg.test.using_gscompleter
     using_depth_alignment = cfg.test.using_depth_alignment
     using_rc_register = cfg.test.using_rc_register
     using_mv_refinement = cfg.test.using_mv_refinement
@@ -311,6 +312,7 @@ def inference(cfg_dict: DictConfig):
                 scene_names=batch['scene'],
                 decoder=decoder.forward,
                 using_stereo_anchor=using_stereo_anchor,
+                using_gscompleter=using_gscompleter,
                 using_depth_alignment=using_depth_alignment,
                 using_rc_register=using_rc_register,
                 using_mv_refinement=using_mv_refinement,

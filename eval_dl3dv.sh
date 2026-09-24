@@ -29,6 +29,7 @@ checkpointing.pretrained_model=pretrained/depthsplat-gs-base-dl3dv-256x448-randv
 output_dir=outputs/4.10/test-video/dl3dv_ctx2_tgt1_n10_w_ours \
 test.save_virtual_video=true \
 test.using_refinement=true \
+test.using_gscompleter=true \
 test.save_image=true \
 test.save_gt_image=true \
 test.render_context=true \

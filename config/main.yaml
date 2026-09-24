@@ -81,6 +81,7 @@ test:
   save_virtual_video: false
   save_colmap: false
   using_refinement: false
+  using_gscompleter: false
   save_depth_npy: false
   save_depth_concat_img: false
   save_gaussian: false

@@ -28,6 +28,7 @@ test.render_context=true \
 # checkpointing.pretrained_model=pretrained/depthsplat-gs-base-re10k-256x256-view2-ca7b6795.pth \
 # output_dir=outputs/1.24/evaluation_index_extrapolation/re10k_ctx2_tgt1_n30-final \
 # test.using_refinement=true \
+# test.using_gscompleter=true \
 # test.save_image=true \
 # test.save_gt_image=true \
 # test.render_context=true \

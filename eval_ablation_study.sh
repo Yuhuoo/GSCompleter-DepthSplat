@@ -22,17 +22,18 @@ BASE_OUT="outputs-5-14/ablation_study-3"
 SUB_DIR="dl3dv_ctx2_tgt1_n10_w_dilation"
 
 # 2. 定义实验配置数组
-# 格式: "GPU_ID | 实验名 | using_refinement | using_stereo_anchor | using_depth_alignment | using_rc_register | using_mv_refinement | using_target_align"
+# 格式: "GPU_ID | 实验名 | using_refinement | using_gscompleter | using_stereo_anchor | using_depth_alignment | using_rc_register | using_mv_refinement | using_target_align"
 experiments=(
-    "0 | baseline         | false | false | false | false | false | false"
-    # "1 | ours-all         | true  | true  | true  | true  | true  | false"
-    # "2 | ours-wo-sa       | true  | false | true  | true  | true  | false"
-    # "3 | ours-wo-da       | true  | true  | false | true  | true  | false"
-    # "4 | ours-wo-da-wo-rc | true  | true  | false | false | true  | false"
-    # "5 | ours-wo-rc       | true  | true  | true  | false | true  | false"
-    # "6 | ours-wo-mv       | true  | true  | true  | true  | false | false"
-    # "7 | ours-wo-all       | true  | false  | false | false | false  | false"
-    # "7 | ours-tgt-align   | true  | true  | true  | true  | true | true"
+    "0 | baseline         | false | false | false | false | false | false | false"
+    # Original component ablations. Uncomment the rows to run them.
+    # "1 | ours-all         | true  | true | true  | true  | true  | true  | false"
+    # "2 | ours-wo-sa       | true  | true | false | true  | true  | true  | false"
+    # "3 | ours-wo-da       | true  | true | true  | false | true  | true  | false"
+    # "4 | ours-wo-da-wo-rc | true  | true | true  | false | false | true  | false"
+    # "5 | ours-wo-rc       | true  | true | true  | true  | false | true  | false"
+    # "6 | ours-wo-mv       | true  | true | true  | true  | true  | false | false"
+    # "7 | ours-wo-all      | true  | true | false | false | false | false | false"
+    # "8 | ours-tgt-align   | true  | true | true  | true  | true  | true  | true"
 )
 
 echo "开始并行实验任务..."
@@ -40,12 +41,13 @@ echo "开始并行实验任务..."
 # 3. 循环遍历并启动后台进程
 for exp in "${experiments[@]}"; do
     # 解析数组行（使用 IFS 分隔符）
-    IFS='|' read -r gpu name re sa da rc mv ta<<< "$exp"
+    IFS='|' read -r gpu name re gc sa da rc mv ta<<< "$exp"
     
     # 去除首尾空格
     gpu=$(echo $gpu | xargs)
     name=$(echo $name | xargs)
     re=$(echo $re | xargs)
+    gc=$(echo $gc | xargs)
     sa=$(echo $sa | xargs)
     da=$(echo $da | xargs)
     rc=$(echo $rc | xargs)
@@ -58,6 +60,7 @@ for exp in "${experiments[@]}"; do
     CUDA_VISIBLE_DEVICES=$gpu python -m src.infer $COMMON_ARGS \
         output_dir=$BASE_OUT/$name/$SUB_DIR \
         test.using_refinement=$re \
+        test.using_gscompleter=$gc \
         test.using_stereo_anchor=$sa \
         test.using_depth_alignment=$da \
         test.using_rc_register=$rc \

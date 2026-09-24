@@ -58,6 +58,7 @@ for i in "${!index_paths[@]}"; do
         checkpointing.pretrained_model="pretrained/depthsplat-gs-base-dl3dv-256x448-randview2-6-02c7b19d.pth" \
         output_dir="$output_dir" \
         test.using_refinement=true \
+        test.using_gscompleter=true \
         test.save_image=true \
         test.save_gt_image=true \
         test.render_context=true \
