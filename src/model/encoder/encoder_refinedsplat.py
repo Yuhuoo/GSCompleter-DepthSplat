@@ -166,6 +166,19 @@ def l1_loss(network_output, gt):
 def inverse_sigmoid(x):
     return torch.log(x / (1 - x + 1e-6))
 
+
+def get_dilated_hole_mask(hole_tags, height, width, dilation_radius=3):
+    if hole_tags.numel() != height * width:
+        raise ValueError(
+            f"Hole mask has {hole_tags.numel()} values, expected {height * width}."
+        )
+    hole_mask = hole_tags.reshape(1, 1, height, width).float()
+    kernel_size = 2 * dilation_radius + 1
+    dilated_mask = F.max_pool2d(
+        hole_mask, kernel_size=kernel_size, stride=1, padding=dilation_radius
+    )
+    return hole_mask, dilated_mask, dilated_mask.reshape(-1) > 0.5
+
 # -----------------------------------------------------------------------------
 # 2. Gaussian TTO Optimizer
 # -----------------------------------------------------------------------------
@@ -418,14 +431,10 @@ class GaussianTTOOptimizer(nn.Module):
         if use_mask_dilation:
             # --- Strategy A: Hard Hole Filter with Dilation ---
             H, W = target_render_pkg['h'], target_render_pkg['w']
-            hole_mask_2d = hole_tags.view(1, 1, H, W).float()
             dilation_radius = 3 
-            kernel_size = 2 * dilation_radius + 1
-            padding = dilation_radius
-            
-            # Max pooling acts as morphological dilation on binary mask
-            dilated_hole_mask = F.max_pool2d(hole_mask_2d, kernel_size=kernel_size, stride=1, padding=padding)
-            keep_mask = (dilated_hole_mask.view(-1) > 0.5)
+            hole_mask_2d, dilated_hole_mask, keep_mask = get_dilated_hole_mask(
+                hole_tags, H, W, dilation_radius
+            )
             
             print(f"  [TTO Stage 2-Filter Mask Dilation] Original Hole: {hole_tags.sum()} -> Dilated Hole (+{dilation_radius}px): {keep_mask.sum()} pixels.")
 
@@ -948,8 +957,25 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                             debug_dir=debug_dir
                         )
                     else:
-                        print("ablation study: generated content only (skip GSCompleter TTO).")
-                        refined_target_gaussians = target_gaussians
+                        print("ablation study: generated content only (hole-mask filtered; skip GSCompleter TTO).")
+                        _, _, generated_keep_mask = get_dilated_hole_mask(
+                            hole_tags,
+                            h,
+                            w,
+                        )
+                        if target_gaussians.means.shape[1] != generated_keep_mask.numel():
+                            raise ValueError(
+                                "Generated Gaussian count does not match the target-view hole mask: "
+                                f"{target_gaussians.means.shape[1]} vs {generated_keep_mask.numel()}."
+                            )
+                        generated_keep_mask = generated_keep_mask.to(
+                            device=target_gaussians.means.device
+                        )
+                        generated_data = {
+                            field.name: getattr(target_gaussians, field.name)[:, generated_keep_mask]
+                            for field in fields(Gaussians)
+                        }
+                        refined_target_gaussians = Gaussians(**generated_data)
 
                     num_gaussians = refined_target_gaussians.means.shape[1]
                     print(f"*************Update {num_gaussians} gaussians to map*************")
