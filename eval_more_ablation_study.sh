@@ -24,9 +24,9 @@ SUB_DIR="dl3dv_ctx2_tgt1_n10_w_dilation"
 # 2. 定义实验配置数组
 # 格式: "GPU_ID | 实验名 | using_refinement | using_gscompleter | using_stereo_anchor | using_depth_alignment | using_rc_register | using_mv_refinement | using_target_align"
 experiments=(
-    "0 | baseline         | false | false | false | false | false | false | false"
+    # "0 | baseline         | false | false | false | false | false | false | false"
     # Use separate GPUs, or run these rows sequentially on a single GPU.
-    # "1 | generated-only   | true  | false | true  | false | false | false | false"
+    "0 | generated-only-update   | true  | false | true  | false | false | false | false"
     # "2 | gscompleter      | true  | true  | true  | true  | true  | true  | false"
 )
 

@@ -1,9 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Runtime configuration. Values can be overridden at invocation time, e.g.
+# GPU_ID=1 bash eval_three_way_re10k_acid.sh
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CONDA_ROOT="${CONDA_ROOT:-/inspire/hdd/project/agentend2end/xieyuan-24039/ga/software/anaconda3}"
+CONDA_ENV="${CONDA_ENV:-gscompleter}"
 GPU_ID="${GPU_ID:-0}"
-PYTHON_BIN="${PYTHON_BIN:-python}"
-OUT_ROOT="${OUT_ROOT:-outputs/three_way_ablation}"
+OUT_ROOT="${OUT_ROOT:-outputs-9-30/three_way_ablation}"
+
+# Initialise Conda from the installation used by this project.
+CONDA_SH="${CONDA_ROOT}/etc/profile.d/conda.sh"
+if [[ ! -f "$CONDA_SH" ]]; then
+    printf 'Conda initialization script not found: %s\n' "$CONDA_SH" >&2
+    exit 1
+fi
+source "$CONDA_SH"
+conda activate "$CONDA_ENV"
+
+cd "$SCRIPT_DIR"
+
+PYTHON_BIN="${PYTHON_BIN:-${CONDA_ROOT}/envs/${CONDA_ENV}/bin/python}"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    printf 'Python executable not found or not executable: %s\n' "$PYTHON_BIN" >&2
+    exit 1
+fi
 
 RE10K_INDEX="assets/evaluation_index_extrapolation/re10k/re10k_ctx2_tgt1_n30.json"
 ACID_INDEX="assets/evaluation_index_extrapolation/acid/acid_ctx2_tgt1_n30.json"
@@ -102,8 +123,8 @@ run_eval() {
         "test.using_rc_register=$rc_register" \
         "test.using_mv_refinement=$mv_refinement" \
         "test.using_target_align=$target_align" \
-        test.save_image=true \
-        test.save_gt_image=true \
+        test.save_image=false \
+        test.save_gt_image=false \
         test.render_context=true \
         hydra/job_logging=stdout \
         hydra.output_subdir=null
