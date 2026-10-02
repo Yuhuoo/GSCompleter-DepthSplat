@@ -49,7 +49,7 @@ for i in "${!index_paths[@]}"; do
     CUDA_VISIBLE_DEVICES=$gpu python -m src.infer \
         +experiment=dl3dv \
         dataset/view_sampler=evaluation \
-        dataset.view_sampler.num_context_views=6 \
+        dataset.view_sampler.num_context_views=2 \
         dataset.view_sampler.index_path="$index_path" \
         model.encoder.num_scales=2 \
         model.encoder.upsample_factor=4 \
