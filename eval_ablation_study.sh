@@ -4,7 +4,7 @@
 COMMON_ARGS="+experiment=dl3dv mode=test \
     dataset.roots=[datasets/dl3dv] \
     dataset/view_sampler=evaluation \
-    dataset.view_sampler.num_context_views=6 \
+    dataset.view_sampler.num_context_views=2 \
     dataset.view_sampler.index_path=assets/evaluation_index_extrapolation/dl3dv/dl3dv_ctx2_tgt1_n10.json \
     model.encoder.num_scales=2 \
     model.encoder.upsample_factor=4 \
