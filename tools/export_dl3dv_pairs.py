@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import shutil
 from pathlib import Path
 
 import torch
@@ -106,6 +107,8 @@ def main() -> None:
         if scene_dir.exists() and not args.overwrite:
             print(f"[skip] exists: {scene_dir}")
             continue
+        if scene_dir.exists() and args.overwrite:
+            shutil.rmtree(scene_dir)
         image_dir = scene_dir / "images"
         image_dir.mkdir(parents=True, exist_ok=True)
 
@@ -115,7 +118,9 @@ def main() -> None:
         camera_records = []
         height = width = None
         for output_id, source_id in enumerate(selected_ids):
-            image_path = image_dir / f"{output_id:06d}.png"
+            # Preserve the original sequence frame id. This keeps the
+            # exported pair easy to inspect and consistent with the index.
+            image_path = image_dir / f"{source_id:06d}.png"
             height, width = decode_image(example["images"][source_id], image_path)
             image_files.append(str(image_path.relative_to(scene_dir)).replace("\\", "/"))
 
@@ -125,7 +130,7 @@ def main() -> None:
             c2w = torch.linalg.inv(w2c)
             camera_records.append(
                 {
-                    "cam_id": output_id,
+                    "cam_id": source_id,
                     "cam_quat": rotation_to_xyzw(c2w[:3, :3]),
                     "cam_trans": c2w[:3, 3].tolist(),
                     "image_name": image_files[-1],
