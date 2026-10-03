@@ -138,11 +138,15 @@ def main() -> None:
             )
 
         first_camera = cameras[selected_ids[0]]
+        # DL3DV stores the first four camera values as normalized intrinsics,
+        # which is also the convention used by DepthSplat's dataset loader.
+        # Keep that representation in the exported metadata. RegGS converts
+        # it to pixel units when loading and normalizes it again for NoPoSplat.
         intrinsics = {
-            "fx": float(first_camera[0]) / width,
-            "fy": float(first_camera[1]) / height,
-            "cx": float(first_camera[2]) / width,
-            "cy": float(first_camera[3]) / height,
+            "fx": float(first_camera[0]),
+            "fy": float(first_camera[1]),
+            "cx": float(first_camera[2]),
+            "cy": float(first_camera[3]),
         }
         (scene_dir / "cameras.json").write_text(
             json.dumps(camera_records, indent=2), encoding="utf-8"
