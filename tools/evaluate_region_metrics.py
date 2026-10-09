@@ -19,6 +19,7 @@ import argparse
 import csv
 import json
 import math
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -50,19 +51,50 @@ def load_mask(path: Path, shape: Tuple[int, int]) -> torch.Tensor:
     return torch.from_numpy(array < 0.5)
 
 
+@lru_cache(maxsize=None)
 def find_mask(mask_root: Path, scene: str, target_id: int) -> Path:
-    scene_dir = mask_root / "debug" / "vis" / scene
-    if not scene_dir.exists():
-        raise FileNotFoundError(f"Mask scene directory does not exist: {scene_dir}")
-
+    """Find masks from both the current and legacy scene-directory layouts."""
     target = str(target_id)
-    candidates = sorted(scene_dir.glob(f"view_*_{target}_tgt_align_mask.png"))
+    scene_token = Path(scene).name
+    scene_tokens = {scene, scene_token}
+
+    # Legacy runs removed the final len('/nerfstudio') characters from the
+    # hexadecimal scene hash when constructing debug/vis directory names.
+    if len(scene_token) >= 32 and all(c in "0123456789abcdefABCDEF" for c in scene_token):
+        scene_tokens.add(scene_token[:-len("/nerfstudio")])
+
+    patterns = (
+        f"view_*_{target}_tgt_align_mask.png",
+        f"view_*_{target_id:06d}_tgt_align_mask.png",
+    )
+    search_roots = [mask_root]
+    debug_vis = mask_root / "debug" / "vis"
+    if debug_vis.is_dir():
+        search_roots.insert(0, debug_vis)
+
+    candidates = []
+    for root in search_roots:
+        for token in scene_tokens:
+            scene_dir = root / token
+            if scene_dir.is_dir():
+                for pattern in patterns:
+                    candidates.extend(scene_dir.glob(pattern))
+
+    # Also support MASK_ROOT pointing to a parent directory or directly to
+    # debug/vis, which is common for outputs copied from another run.
     if not candidates:
-        # Also accept zero-padded target indices if a future exporter uses them.
-        candidates = sorted(scene_dir.glob(f"view_*_{target_id:06d}_tgt_align_mask.png"))
+        for root in search_roots:
+            if root.is_dir():
+                for pattern in patterns:
+                    candidates.extend(
+                        path for path in root.rglob(pattern)
+                        if path.parent.name in scene_tokens
+                    )
+
+    candidates = sorted(set(candidates))
     if not candidates:
         raise FileNotFoundError(
-            f"No fixed target mask for scene={scene}, target={target_id} under {scene_dir}"
+            f"No fixed target mask for scene={scene}, target={target_id} under {mask_root}."
         )
     return candidates[0]
 

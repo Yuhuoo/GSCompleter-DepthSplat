@@ -687,7 +687,13 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
 
         # [DEBUG] save context image
         output_dir = get_cfg().get("output_dir")
-        scene_name = scene_names[0][:-len('/nerfstudio')] if scene_names else "scene"
+        raw_scene_name = str(scene_names[0]) if scene_names else "scene"
+        scene_suffix = "/nerfstudio"
+        scene_name = (
+            raw_scene_name[:-len(scene_suffix)]
+            if raw_scene_name.endswith(scene_suffix)
+            else raw_scene_name
+        )
         # vis_dir = os.path.join(output_dir, "debug/before", scene_name)
         # self._save_images(decoder, flat_context_gaussians, context, h, w, vis_dir)
         
