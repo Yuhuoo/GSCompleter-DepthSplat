@@ -2,10 +2,26 @@ import json
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
-from time import time
+from time import perf_counter
 
 import numpy as np
 import torch
+
+
+def synchronize_cuda() -> None:
+    """Synchronize GPU work before wall-clock measurements."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def timer_start() -> float:
+    synchronize_cuda()
+    return perf_counter()
+
+
+def timer_stop(start: float) -> float:
+    synchronize_cuda()
+    return perf_counter() - start
 
 
 class Benchmarker:
@@ -15,12 +31,12 @@ class Benchmarker:
     @contextmanager
     def time(self, tag: str, num_calls: int = 1):
         try:
-            start_time = time()
+            start_time = timer_start()
             yield
         finally:
-            end_time = time()
+            elapsed = timer_stop(start_time)
             for _ in range(num_calls):
-                self.execution_times[tag].append((end_time - start_time) / num_calls)
+                self.execution_times[tag].append(elapsed / num_calls)
 
     def dump(self, path: Path) -> None:
         path.parent.mkdir(exist_ok=True, parents=True)

@@ -14,11 +14,25 @@ from ..types import Gaussians
 from .encoder_depthsplat import EncoderDepthSplat, EncoderDepthSplatCfg
 from src.global_cfg import get_cfg
 from ...misc.image_io import save_image
+from ...misc.benchmarker import timer_start, timer_stop
 
 from .common.gaussians import build_covariance
-import time
 from sklearn.linear_model import RANSACRegressor
 from src.model.ply_export import save_gaussian_ply
+
+
+def save_debug_image(image, path) -> None:
+    if os.environ.get("GS_RUNTIME_NO_DEBUG_IO", "0") != "1":
+        save_image(image, path)
+
+
+def runtime_debug_io_enabled() -> bool:
+    return os.environ.get("GS_RUNTIME_NO_DEBUG_IO", "0") != "1"
+
+
+def runtime_quiet() -> bool:
+    return os.environ.get("GS_RUNTIME_QUIET", "0") == "1"
+
 
 # -----------------------------------------------------------------------------
 # 1. Helper Functions & Evaluator
@@ -209,6 +223,10 @@ class GaussianTTOOptimizer(nn.Module):
         self.context_view_sample_k = context_view_sample_k
 
         self.evaluator = GeometricEvaluator("cuda")
+        self.last_timing = {
+            "registration": 0.0,
+            "refinement": 0.0,
+        }
 
     # [CODE RETAINED BUT UNUSED] Stage 2.5: Optimize monsters
     def _optimize_monsters(self, decoder, flat_context_gaussians, monster_indices, target_render_pkg, gt_image, c2w_rot, device):
@@ -289,12 +307,19 @@ class GaussianTTOOptimizer(nn.Module):
 
         with torch.no_grad():
             flat_context_gaussians = self.flatten_gaussians(context_gaussians)
-            gt_render_out = decoder(context_gaussians, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], target_render_pkg['near'], target_render_pkg['far'], (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
-            gt_scene_depth = gt_render_out.depth[0].squeeze(1) 
-            gt_valid_mask = gt_render_out.alpha[0].squeeze(0) > 0.5 
-            gt_scene_means = context_gaussians.means.squeeze(0)
+            if runtime_quiet():
+                gt_scene_depth = None
+                gt_valid_mask = None
+                gt_scene_means = None
+            else:
+                gt_render_out = decoder(context_gaussians, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], target_render_pkg['near'], target_render_pkg['far'], (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
+                gt_scene_depth = gt_render_out.depth[0].squeeze(1)
+                gt_valid_mask = gt_render_out.alpha[0].squeeze(0) > 0.5
+                gt_scene_means = context_gaussians.means.squeeze(0)
 
         def run_eval(step_label, current_gaussians):
+            if runtime_quiet():
+                return
             with torch.no_grad():
                 curr_out = decoder(current_gaussians, target_render_pkg['extrinsics'], target_render_pkg['intrinsics'], target_render_pkg['near'], target_render_pkg['far'], (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
                 self.evaluator.evaluate(step_label, curr_out.depth[0].squeeze(1), gt_scene_depth, current_gaussians.means.squeeze(0), gt_scene_means, gt_valid_mask)
@@ -364,7 +389,7 @@ class GaussianTTOOptimizer(nn.Module):
             if not using_rc_register:
                 print("ablation study 3: w/o ray-constrained register.")
                 self.steps_stage1 = 0
-            start_time = time.time()
+            start_time = timer_start()
             for step in range(self.steps_stage1):
                 optimizer_s1.zero_grad()
                 
@@ -380,7 +405,8 @@ class GaussianTTOOptimizer(nn.Module):
                 total_loss = 1.0 * loss_depth + 0.1 * loss_rgb
                 
                 if step % 10 == 0:
-                    print(f"    Step {step} | Target align: Depth Loss: {loss_depth.item():.4f}, RGB Loss: {loss_rgb.item():.4f}")
+                    if not runtime_quiet():
+                        print(f"    Step {step} | Target align: Depth Loss: {loss_depth.item():.4f}, RGB Loss: {loss_rgb.item():.4f}")
                 
                 if stereo_anchor_idx is not None:
                     stereo_out = decoder(curr_target_gaussians, anchor_extrinsics, anchor_intrinsics, anchor_near, anchor_far, (target_render_pkg['h'], target_render_pkg['w']), depth_mode="depth")
@@ -395,14 +421,16 @@ class GaussianTTOOptimizer(nn.Module):
                         total_loss += 1.0 * loss_stereo
                         
                         if step % 10 == 0:
-                            print(f"    Step {step} | Stereo Loss: {loss_stereo.item():.4f}")
+                            if not runtime_quiet():
+                                print(f"    Step {step} | Stereo Loss: {loss_stereo.item():.4f}")
 
                 total_loss.backward()
                 optimizer_s1.step()
                 with torch.no_grad(): 
                     opt_dists.data = torch.clamp(opt_dists.data, min=0.1)
 
-            rc_register_cost_time = time.time() - start_time
+            rc_register_cost_time = timer_stop(start_time)
+            self.last_timing["registration"] = rc_register_cost_time
             print(f"====rc_register cost time {rc_register_cost_time}====")
 
         # ## [DEBUG]
@@ -436,15 +464,17 @@ class GaussianTTOOptimizer(nn.Module):
                 hole_tags, H, W, dilation_radius
             )
             
-            print(f"  [TTO Stage 2-Filter Mask Dilation] Original Hole: {hole_tags.sum()} -> Dilated Hole (+{dilation_radius}px): {keep_mask.sum()} pixels.")
+            if not runtime_quiet():
+                print(f"  [TTO Stage 2-Filter Mask Dilation] Original Hole: {hole_tags.sum()} -> Dilated Hole (+{dilation_radius}px): {keep_mask.sum()} pixels.")
 
-            mask_vis = hole_mask_2d.float().cpu().squeeze()
-            if mask_vis.dim() == 2: mask_vis = mask_vis.unsqueeze(0).repeat(3, 1, 1)
-            save_image(mask_vis, os.path.join(debug_dir, f"view_hole_mask.png"))
-            
-            mask_vis = dilated_hole_mask.float().cpu().squeeze()
-            if mask_vis.dim() == 2: mask_vis = mask_vis.unsqueeze(0).repeat(3, 1, 1)
-            save_image(mask_vis, os.path.join(debug_dir, f"view_dilated_hole_mask.png"))
+            if runtime_debug_io_enabled():
+                mask_vis = hole_mask_2d.float().cpu().squeeze()
+                if mask_vis.dim() == 2: mask_vis = mask_vis.unsqueeze(0).repeat(3, 1, 1)
+                save_debug_image(mask_vis, os.path.join(debug_dir, f"view_hole_mask.png"))
+
+                mask_vis = dilated_hole_mask.float().cpu().squeeze()
+                if mask_vis.dim() == 2: mask_vis = mask_vis.unsqueeze(0).repeat(3, 1, 1)
+                save_debug_image(mask_vis, os.path.join(debug_dir, f"view_dilated_hole_mask.png"))
 
         else:
             # --- Strategy B: Simple Hard Hole Filter ---
@@ -452,10 +482,12 @@ class GaussianTTOOptimizer(nn.Module):
             if keep_mask.dtype != torch.bool:
                 keep_mask = keep_mask > 0.5
             
-            print(f"  [TTO Stage 2-Filter] Using raw mask without dilation.")
+            if not runtime_quiet():
+                print(f"  [TTO Stage 2-Filter] Using raw mask without dilation.")
 
         with torch.no_grad():
-            print(f"  [TTO] Stage 2-Filter Points before: {len(final_means_s1)} -> after: {keep_mask.sum()}")
+            if not runtime_quiet():
+                print(f"  [TTO] Stage 2-Filter Points before: {len(final_means_s1)} -> after: {keep_mask.sum()}")
             if keep_mask.sum() == 0: return target_gaussians
 
             valid_means = final_means_s1[keep_mask]
@@ -496,7 +528,7 @@ class GaussianTTOOptimizer(nn.Module):
             if not using_mv_refinement:
                 print("ablation study 4: w/o multi-view refinement.")
                 self.steps_stage3 = 0
-            start_time = time.time()
+            start_time = timer_start()
             for step in range(self.steps_stage3):
                 optimizer_s2.zero_grad()
                 with torch.no_grad():
@@ -537,16 +569,18 @@ class GaussianTTOOptimizer(nn.Module):
                 final_loss.backward()
                 optimizer_s2.step()
                 
-                if step % 10 == 0:
+                if step % 10 == 0 and not runtime_quiet():
                     print(f"  [TTO Stage-3] Step {step}: AvgRGB={final_loss.item():.4f} (Views: {views_count})")
 
-            mv_refinement_cost_time = time.time() - start_time
+            mv_refinement_cost_time = timer_stop(start_time)
+            self.last_timing["refinement"] = mv_refinement_cost_time
             print(f"====mv_refinement cost time {mv_refinement_cost_time}====")
 
         with torch.no_grad():
             final_scales = torch.exp(opt_log_scales)
             mask_keep = torch.sigmoid(opt_opacities) > 0.05 
-            print(f"  [Pruning] Final Keep: {mask_keep.sum()} / {len(mask_keep)}")
+            if not runtime_quiet():
+                print(f"  [Pruning] Final Keep: {mask_keep.sum()} / {len(mask_keep)}")
 
             valid_means = opt_means[mask_keep]
             valid_scales = final_scales[mask_keep]
@@ -670,10 +704,24 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
         device = context["image"].device
 
         total_time_list = []
-        start_time = time.time()
+        pipeline_start = timer_start()
+        runtime = {
+            "backbone": 0.0,
+            "pe_field": 0.0,
+            "lifting": 0.0,
+            "depth_alignment": 0.0,
+            "registration": 0.0,
+            "refinement": 0.0,
+            "tto_other": 0.0,
+            "target_render": 0.0,
+            "end_to_end": 0.0,
+            "num_targets": 0,
+        }
+        start_time = timer_start()
         with torch.no_grad():
             res_context = self.predict(context, global_step, deterministic, visualization_dump, scene_names)
-        encoder_cost_time = time.time() - start_time
+        encoder_cost_time = timer_stop(start_time)
+        runtime["backbone"] = encoder_cost_time
         print(f"====Context build cost time {encoder_cost_time}====")
         total_time_list.extend([encoder_cost_time, encoder_cost_time])
         
@@ -687,7 +735,13 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
 
         # [DEBUG] save context image
         output_dir = get_cfg().get("output_dir")
-        scene_name = scene_names[0][:-len('/nerfstudio')] if scene_names else "scene"
+        raw_scene_name = str(scene_names[0]) if scene_names else "scene"
+        scene_suffix = "/nerfstudio"
+        scene_name = (
+            raw_scene_name[:-len(scene_suffix)]
+            if raw_scene_name.endswith(scene_suffix)
+            else raw_scene_name
+        )
         # vis_dir = os.path.join(output_dir, "debug/before", scene_name)
         # self._save_images(decoder, flat_context_gaussians, context, h, w, vis_dir)
         
@@ -704,14 +758,21 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
         }
         if extra_context is not None:
             num_targets = extra_context["image"].shape[1]
+            runtime["num_targets"] = int(num_targets)
+            debug_io = runtime_debug_io_enabled()
             debug_dir = os.path.join(output_dir, "debug/vis", scene_name)
-            os.makedirs(debug_dir, exist_ok=True)
+            if debug_io:
+                os.makedirs(debug_dir, exist_ok=True)
 
             for i in range(num_targets):
                 cost_time_per_view = 0.0
                 gaussian_generate_cost_time = 0.0
                 depth_alignment_cost_time = 0.0
                 tto_cost_time = 0.0
+                self.tto_optimizer.last_timing = {
+                    "registration": 0.0,
+                    "refinement": 0.0,
+                }
                 print(f"--- Processing Target View {i} ---")
                 
                 # Dynamic Anchor Selection inside Loop
@@ -751,7 +812,8 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                     mask_to_prune = current_radii > prune_threshold
                     
                     if mask_to_prune.sum() > 0:
-                        print(f"  [Radii Pruning] Detected {mask_to_prune.sum()} artifacts. Re-rendering...")
+                        if not runtime_quiet():
+                            print(f"  [Radii Pruning] Detected {mask_to_prune.sum()} artifacts. Re-rendering...")
                         mask_keep = ~mask_to_prune
                         new_data = {
                             field.name: getattr(flat_context_gaussians, field.name)[:, mask_keep]
@@ -789,7 +851,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                 tgt_sparse_depth = tgt_out.depth[0] * tgt_valid_mask.float()
 
                 # ---------------- PE-Field Fix ----------------
-                start_time = time.time()
+                start_time = timer_start()
 
                 anchor_image = context_render_pkg["image"][:, difix_anchor_idx] 
                 anchor_extrinsic = context_render_pkg["extrinsics"][:, difix_anchor_idx]
@@ -811,50 +873,41 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                 )
                 ## DEBUG
                 # fixed_image_tensor = extra_context["image"][:, i]
-                pe_field_cost_time = time.time() - start_time
+                pe_field_cost_time = timer_stop(start_time)
+                runtime["pe_field"] += pe_field_cost_time
                 print(f"====pe_field cost time {pe_field_cost_time}====")
 
-                # [DEBUG] Visualization
-                with torch.no_grad():
-                    tgt_idx = extra_context["index"][0][i].item()
-                    save_image(tgt_rendered_rgb, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_target_before.png"))
-                    save_image(fixed_image_tensor[0], os.path.join(debug_dir, f"view_{i}_{tgt_idx}_target_after_pe_field.png"))
-                    # save_image(warped_image_tensor[0], os.path.join(debug_dir, f"view_{i}_{tgt_idx}_anchor_warped_target_pe_field.png"))
+                # [DEBUG] Visualization. Skip conversion, device transfer, and disk I/O
+                # entirely during runtime benchmarking.
+                if debug_io:
+                    with torch.no_grad():
+                        tgt_idx = extra_context["index"][0][i].item()
+                        save_debug_image(tgt_rendered_rgb, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_target_before.png"))
+                        save_debug_image(fixed_image_tensor[0], os.path.join(debug_dir, f"view_{i}_{tgt_idx}_target_after_pe_field.png"))
+                        # save_image(warped_image_tensor[0], os.path.join(debug_dir, f"view_{i}_{tgt_idx}_anchor_warped_target_pe_field.png"))
 
-                    save_image(anchor_image, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_anchor_image.png"))
-                    anchor_depth_vis = visualize_depth(context_depths[:, difix_anchor_idx], cmap_name='Spectral')
-                    save_image(anchor_depth_vis, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_anchor_context_depth.png"))
+                        save_debug_image(anchor_image, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_anchor_image.png"))
+                        anchor_depth_vis = visualize_depth(context_depths[:, difix_anchor_idx], cmap_name='Spectral')
+                        save_debug_image(anchor_depth_vis, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_anchor_context_depth.png"))
 
-                    # import pdb; pdb.set_trace()
+                        sparse_depth_vis = visualize_depth(tgt_out.depth[0][0], cmap_name='Spectral')
+                        save_debug_image(sparse_depth_vis, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_target_context_depth.png"))
 
-                    sparse_depth_vis = visualize_depth(tgt_out.depth[0][0], cmap_name='Spectral')
-                    save_image(sparse_depth_vis, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_target_context_depth.png"))
+                        mask_vis = tgt_valid_mask.float().cpu().squeeze()
+                        if mask_vis.dim() == 2: mask_vis = mask_vis.unsqueeze(0).repeat(3, 1, 1)
+                        save_debug_image(mask_vis, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_tgt_align_mask.png"))
 
-                    mask_vis = tgt_valid_mask.float().cpu().squeeze()
-                    if mask_vis.dim() == 2: mask_vis = mask_vis.unsqueeze(0).repeat(3, 1, 1)
-                    save_image(mask_vis, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_tgt_align_mask.png"))
+                        rgb_part = torch.ones_like(mask_vis)
+                        alpha_part = 1.0 - mask_vis[0:1, :, :]
+                        mask_transparent = torch.cat([rgb_part, alpha_part], dim=0)
+                        save_debug_image(mask_transparent, os.path.join(debug_dir, f"view_{i}_02_tgt_align_mask_white_trans.png"))
 
-                    # # color = torch.tensor([0.6, 0.8, 1.0]).view(3, 1, 1) # light_blue
-                    # # color = torch.tensor([0.7, 1.0, 0.7]).view(3, 1, 1) # light_green
-                    # # color = torch.tensor([1.0, 0.0, 0.0]).view(3, 1, 1) # light_red
-                    # color = torch.tensor([1.0, 0.7, 0.7]).view(3, 1, 1) # very_light_red (淡粉红)
-                    # white = torch.tensor([1.0, 1.0, 1.0]).view(3, 1, 1)
-                    # mask_colored = mask_vis * white + (1 - mask_vis) * color
-                    # save_image(mask_colored, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_tgt_align_mask_color.png"))
-
-                    # ---------- Holes ------------
-                    rgb_part = torch.ones_like(mask_vis) 
-                    alpha_part = 1.0 - mask_vis[0:1, :, :] 
-                    mask_transparent = torch.cat([rgb_part, alpha_part], dim=0)
-                    save_image(mask_transparent, os.path.join(debug_dir, f"view_{i}_02_tgt_align_mask_white_trans.png"))
-
-                    # ---------- invert ------------
-                    alpha_part = mask_vis[0:1, :, :]
-                    mask_transparent = torch.cat([rgb_part, alpha_part], dim=0)
-                    save_image(mask_transparent, os.path.join(debug_dir, f"view_{i}_02_tgt_align_mask_white_trans_inverted.png"))
+                        alpha_part = mask_vis[0:1, :, :]
+                        mask_transparent = torch.cat([rgb_part, alpha_part], dim=0)
+                        save_debug_image(mask_transparent, os.path.join(debug_dir, f"view_{i}_02_tgt_align_mask_white_trans_inverted.png"))
 
                 # ---------------- gaussian generate using feed-forward model ----------------
-                start_time = time.time()
+                start_time = timer_start()
                 print(f"Calculate Gaussian Using Anchor: {stereo_anchor_idx} ")
                 with torch.no_grad():
                     pair = {}
@@ -865,11 +918,12 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                         else: val_target = extra_context[key][:, i : i + 1]
                         pair[key] = torch.cat([val_anchor, val_target], dim=1)
                     res_pair = self.predict(pair, global_step, deterministic)
-                    gaussian_generate_cost_time = time.time() - start_time
+                    gaussian_generate_cost_time = timer_stop(start_time)
+                    runtime["lifting"] += gaussian_generate_cost_time
                     print(f"====gaussian generate cost time {gaussian_generate_cost_time}====")
 
                 # ---------------- align using anchor ---------------------------------
-                start_time = time.time()
+                start_time = timer_start()
                 target_gaussians = self._slice_gaussians_views(res_pair["gaussians"], [1])
                 target_gaussians = self._flatten_and_merge_gaussians([target_gaussians], batch_size=1)
 
@@ -880,10 +934,11 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                 anchor_pred_depth = res_pair["depths"][:, 0] 
                 target_pred_depth = res_pair["depths"][:, 1] 
 
-                anchor_pred_depth_vis = visualize_depth(anchor_pred_depth, cmap_name='Spectral')
-                save_image(anchor_pred_depth_vis, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_anchor_pred_depth.png"))
-                target_pred_depth_vis = visualize_depth(target_pred_depth, cmap_name='Spectral')
-                save_image(target_pred_depth_vis, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_target_pred_depth.png"))
+                if debug_io:
+                    anchor_pred_depth_vis = visualize_depth(anchor_pred_depth, cmap_name='Spectral')
+                    save_debug_image(anchor_pred_depth_vis, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_anchor_pred_depth.png"))
+                    target_pred_depth_vis = visualize_depth(target_pred_depth, cmap_name='Spectral')
+                    save_debug_image(target_pred_depth_vis, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_target_pred_depth.png"))
 
                 # ablation study
                 if using_target_align:
@@ -910,15 +965,16 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                 else:
                     aligned_dense_depth = target_pred_depth * scale + shift
 
-                # [DEBUG] Visualization
-                dense_depth_vis = visualize_depth(aligned_dense_depth, cmap_name='Spectral')
-                save_image(dense_depth_vis, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_target_init_aligned_depth.png"))
+                if debug_io:
+                    dense_depth_vis = visualize_depth(aligned_dense_depth, cmap_name='Spectral')
+                    save_debug_image(dense_depth_vis, os.path.join(debug_dir, f"view_{i}_{tgt_idx}_target_init_aligned_depth.png"))
 
-                depth_alignment_cost_time = time.time() - start_time
+                depth_alignment_cost_time = timer_stop(start_time)
+                runtime["depth_alignment"] += depth_alignment_cost_time
                 print(f"====depth alignment cost time {depth_alignment_cost_time}====")
 
                 # ---------------- TTO Optimizer ---------------------------------
-                start_time = time.time()
+                start_time = timer_start()
                 if target_gaussians is not None:
                     num_gaussians = target_gaussians.means.shape[1]
                     hole_tags = tgt_hole_mask.view(-1).bool() 
@@ -955,6 +1011,12 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                             monster_indices=None,
                             enable_opacity_baking=False,
                             debug_dir=debug_dir
+                        )
+                        runtime["registration"] += self.tto_optimizer.last_timing.get(
+                            "registration", 0.0
+                        )
+                        runtime["refinement"] += self.tto_optimizer.last_timing.get(
+                            "refinement", 0.0
                         )
                     else:
                         print("ablation study: generated content only (hole-mask filtered; skip GSCompleter TTO).")
@@ -1006,13 +1068,22 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                     print(f"  -> Total Context Views: {num_current_context}")
                     print(f"  -> Total Context Gaussians: {num_context_gaussians}")
                 
-                tto_cost_time = time.time() - start_time
+                tto_cost_time = timer_stop(start_time)
+                runtime["tto_other"] += max(
+                    0.0,
+                    tto_cost_time
+                    - self.tto_optimizer.last_timing.get("registration", 0.0)
+                    - self.tto_optimizer.last_timing.get("refinement", 0.0),
+                )
                 print(f"====TTO cost time {tto_cost_time}====")
             
                 cost_time_per_view = gaussian_generate_cost_time + depth_alignment_cost_time + tto_cost_time
                 total_time_list.append(cost_time_per_view)
         
         results = {"gaussians": flat_context_gaussians}
+
+        runtime["end_to_end"] = timer_stop(pipeline_start)
+        results["runtime"] = runtime
         
         if return_time:
             # total_time_list 不包含PE-field

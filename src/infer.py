@@ -2,10 +2,10 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import json
-import time
 import warnings
 import shutil
 import math
+import contextlib
 from pathlib import Path
 
 import torch
@@ -30,7 +30,7 @@ with install_import_hook(("src",), ("beartype", "beartype")):
     from src.model.encoder.encoder_refinedsplat import EncoderDepthSplatRefiner
     from src.evaluation.metrics import compute_lpips, compute_psnr, compute_ssim
     from src.misc.step_tracker import StepTracker
-    from src.misc.benchmarker import Benchmarker
+    from src.misc.benchmarker import Benchmarker, timer_start, timer_stop
     from src.misc.image_io import save_image, save_video
     from src.visualization.vis_depth import viz_depth_tensor
     from src.model.ply_export import save_gaussian_ply
@@ -249,6 +249,9 @@ def inference(cfg_dict: DictConfig):
     # 指标容器
     test_step_outputs = {"psnr": [], "ssim": [], "lpips": []}
     time_skip_steps_dict = {"encoder": 0, "decoder": 0}
+    runtime_records = []
+    runtime_limit = int(os.environ.get("RUNTIME_LIMIT", "-1"))
+    quiet_runtime = os.environ.get("GS_RUNTIME_QUIET", "0") == "1"
 
     # 3. 加载权重
     if cfg.checkpointing.pretrained_model is not None:
@@ -271,6 +274,8 @@ def inference(cfg_dict: DictConfig):
     print(cyan(f"\nStarting Inference Loop ({len(test_loader)} samples)..."))
     
     for batch_idx, batch in enumerate(tqdm(test_loader, desc="Inference")):
+        if runtime_limit > 0 and batch_idx >= runtime_limit:
+            break
         # if batch_idx > 10:
         #     break
         torch.manual_seed(42) # 固定种子
@@ -283,6 +288,7 @@ def inference(cfg_dict: DictConfig):
             batch[k] = {nk: nv.to(device) if isinstance(nv, torch.Tensor) else nv for nk, nv in batch[k].items()}
 
         (scene,) = batch["scene"]
+        pipeline_start = timer_start()
 
 
 
@@ -302,26 +308,42 @@ def inference(cfg_dict: DictConfig):
             extra_context = None
 
         # --- Encoder Step ---
-        with benchmarker.time("encoder"):
-            gaussians = encoder(
-                batch["context"],
-                global_step=0, 
-                deterministic=False,
-                visualization_dump=visualization_dump,
-                extra_context=extra_context,
-                scene_names=batch['scene'],
-                decoder=decoder.forward,
-                using_stereo_anchor=using_stereo_anchor,
-                using_gscompleter=using_gscompleter,
-                using_depth_alignment=using_depth_alignment,
-                using_rc_register=using_rc_register,
-                using_mv_refinement=using_mv_refinement,
-                using_target_align=using_target_align,
-                angle_deg=angle_deg,
-            )
+        stdout_target = open(os.devnull, "w") if quiet_runtime else None
+        stderr_target = open(os.devnull, "w") if quiet_runtime else None
+        output_context = contextlib.ExitStack()
+        if quiet_runtime:
+            output_context.enter_context(contextlib.redirect_stdout(stdout_target))
+            output_context.enter_context(contextlib.redirect_stderr(stderr_target))
+        try:
+            with output_context:
+                with benchmarker.time("encoder"):
+                    gaussians = encoder(
+                        batch["context"],
+                        global_step=0,
+                        deterministic=False,
+                        visualization_dump=visualization_dump,
+                        extra_context=extra_context,
+                        scene_names=batch['scene'],
+                        decoder=decoder.forward,
+                        using_stereo_anchor=using_stereo_anchor,
+                        using_gscompleter=using_gscompleter,
+                        using_depth_alignment=using_depth_alignment,
+                        using_rc_register=using_rc_register,
+                        using_mv_refinement=using_mv_refinement,
+                        using_target_align=using_target_align,
+                        angle_deg=angle_deg,
+                    )
+        finally:
+            if stdout_target is not None:
+                stdout_target.close()
+            if stderr_target is not None:
+                stderr_target.close()
             if isinstance(gaussians, dict):
                 pred_depths = gaussians["depths"]
+                runtime = dict(gaussians.get("runtime", {}))
                 gaussians = gaussians["gaussians"]
+            else:
+                runtime = {}
 
         # --- Save Gaussian PLY ---
         if cfg.test.save_gaussian:
@@ -331,12 +353,15 @@ def inference(cfg_dict: DictConfig):
 
         # --- Decoder Step (Rendering) ---
         if not cfg.train.forward_depth_only:
+            decoder_start = timer_start()
             with benchmarker.time("decoder", num_calls=v):
                 target_output = decoder.forward(
                     gaussians, batch["target"]["extrinsics"], batch["target"]["intrinsics"],
                     batch["target"]["near"], batch["target"]["far"], (h, w), depth_mode=None
                 )
                 images_prob = target_output.color
+            runtime["target_render"] = timer_stop(decoder_start)
+            runtime["end_to_end"] = timer_stop(pipeline_start)
 
             # --- Save Results & Compute Metrics ---
             rgb_gt = batch["target"]["image"][0] # [V, 3, H, W]
@@ -417,11 +442,17 @@ def inference(cfg_dict: DictConfig):
                 save_path.parent.mkdir(parents=True, exist_ok=True)
                 Image.fromarray(depth_viz).save(save_path)
 
+        if "end_to_end" not in runtime:
+            runtime["end_to_end"] = timer_stop(pipeline_start)
+        runtime["scene"] = str(scene)
+        runtime["batch_index"] = int(batch_idx)
+        runtime_records.append(runtime)
+
     print(cyan("\nFinalizing Metrics..."))
 
     tto_opt = getattr(encoder, "tto_optimizer", None)
     geometry_summary = ""
-    if tto_opt and hasattr(tto_opt, "evaluator"):
+    if not quiet_runtime and tto_opt and hasattr(tto_opt, "evaluator"):
         geometry_summary = tto_opt.evaluator.summarize(save_path=str(output_dir / "geometry_metrics.txt"))
 
     final_results = {}
@@ -450,6 +481,41 @@ def inference(cfg_dict: DictConfig):
     print(f"Fallback_cnt:{encoder._cnt_fallback}")
 
     benchmarker.dump(metrics_dir / "benchmark.json")
+
+    runtime_path = output_dir / "runtime_summary.json"
+    runtime_summary = {
+        "protocol": {
+            "description": "Per-scene GPU-synchronized inference time after model loading; excludes file saving, metric computation, and one-time initialization.",
+            "runtime_limit": runtime_limit,
+            "includes": [
+                "backbone", "pe_field", "lifting", "depth_alignment",
+                "registration", "refinement", "target_render", "end_to_end",
+            ],
+        },
+        "num_scenes": len(runtime_records),
+        "scenes": runtime_records,
+    }
+    timed_keys = [
+        "backbone", "pe_field", "lifting", "depth_alignment",
+        "registration", "refinement", "tto_other", "target_render", "end_to_end",
+    ]
+    if runtime_records:
+        runtime_summary["mean_seconds"] = {
+            key: float(np.mean([record.get(key, 0.0) for record in runtime_records]))
+            for key in timed_keys
+        }
+        runtime_summary["std_seconds"] = {
+            key: float(np.std([record.get(key, 0.0) for record in runtime_records], ddof=1))
+            if len(runtime_records) > 1 else 0.0
+            for key in timed_keys
+        }
+        runtime_summary["median_seconds"] = {
+            key: float(np.median([record.get(key, 0.0) for record in runtime_records]))
+            for key in timed_keys
+        }
+    with runtime_path.open("w") as f:
+        json.dump(runtime_summary, f, indent=2)
+    print(cyan(f"Runtime summary saved to {runtime_path}"))
 
     summary_path = output_dir / "metrics_summary.txt"
     print(f"Saving metrics summary to {summary_path}")
