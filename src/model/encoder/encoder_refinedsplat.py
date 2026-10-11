@@ -647,13 +647,13 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
         self.rotation_weight = 1.0
         self.translation_weight = 1.0
         
-        print("Loading PE Pipeline (from ~/code/pe_field)...")
-        external_pe_root = os.path.expanduser("~/gaoao/code")
+        # PE-Field and TTO are only required by the optional refinement path.
+        print("Loading PE Pipeline (from /inspire/hdd/global_user/xieyuan-24039/ga/code/GSCompleter/GSCompleter-PE-Field)...")
+        external_pe_root = os.path.expanduser("/inspire/hdd/global_user/xieyuan-24039/ga/code/GSCompleter/GSCompleter-PE-Field")
         if external_pe_root not in sys.path:
             sys.path.insert(0, external_pe_root)
-            
-        import pe_field
-        from pe_field.pipeline_pe_field import PEFieldPipeline
+
+        from pipeline_pe_field import PEFieldPipeline
         self.pe_field = PEFieldPipeline()
 
         self.tto_optimizer = GaussianTTOOptimizer()
