@@ -93,6 +93,11 @@ test:
   using_rc_register: false
   using_mv_refinement: false
   using_target_align: false
+  # legacy keeps the original using_rc_register switch. New robustness runs
+  # use ray or free to compare constrained and unrestricted registration.
+  registration_mode: legacy
+  registration_perturbation: none
+  perturbation_strength: 0.0
   angle_deg: 45.0
   hole_mask_threshold: 0.5
   dilation_radius: 3

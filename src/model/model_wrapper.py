@@ -82,6 +82,9 @@ class TestCfg:
     using_rc_register: bool
     using_mv_refinement: bool
     using_target_align: bool
+    registration_mode: str
+    registration_perturbation: str
+    perturbation_strength: float
     angle_deg: float
     hole_mask_threshold: float
     dilation_radius: int

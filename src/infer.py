@@ -221,6 +221,9 @@ def inference(cfg_dict: DictConfig):
     using_rc_register = cfg.test.using_rc_register
     using_mv_refinement = cfg.test.using_mv_refinement
     using_target_align = cfg.test.using_target_align
+    registration_mode = cfg.test.registration_mode
+    registration_perturbation = cfg.test.registration_perturbation
+    perturbation_strength = cfg.test.perturbation_strength
     angle_deg = cfg.test.angle_deg
     hole_mask_threshold = cfg.test.hole_mask_threshold
     dilation_radius = cfg.test.dilation_radius
@@ -339,6 +342,9 @@ def inference(cfg_dict: DictConfig):
                         using_rc_register=using_rc_register,
                         using_mv_refinement=using_mv_refinement,
                         using_target_align=using_target_align,
+                        registration_mode=registration_mode,
+                        registration_perturbation=registration_perturbation,
+                        perturbation_strength=perturbation_strength,
                         angle_deg=angle_deg,
                         hole_mask_threshold=hole_mask_threshold,
                         dilation_radius=dilation_radius,

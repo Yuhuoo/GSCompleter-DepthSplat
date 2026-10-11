@@ -193,6 +193,46 @@ def get_dilated_hole_mask(hole_tags, height, width, dilation_radius=3):
     )
     return hole_mask, dilated_mask, dilated_mask.reshape(-1) > 0.5
 
+
+def shift_mask_without_wrap(mask: torch.Tensor, height: int, width: int, shift_px: int) -> torch.Tensor:
+    """Translate a binary mask with zero padding instead of circular wrapping."""
+    source = mask.reshape(height, width)
+    shifted = torch.zeros_like(source)
+    if shift_px >= 0:
+        if shift_px < width:
+            shifted[:, shift_px:] = source[:, : width - shift_px]
+    else:
+        shift_px = -shift_px
+        if shift_px < width:
+            shifted[:, : width - shift_px] = source[:, shift_px:]
+    return shifted.reshape_as(mask)
+
+
+def apply_position_perturbation(
+    means: torch.Tensor,
+    target_c2w: torch.Tensor,
+    height: int,
+    width: int,
+    perturbation: str,
+    strength: float,
+) -> torch.Tensor:
+    """Apply a controlled lateral perturbation to generated target Gaussians."""
+    if perturbation not in {"lateral_offset", "object_shift"} or strength == 0:
+        return means
+    if means.shape[0] != height * width:
+        raise ValueError(
+            "Position perturbations require one generated Gaussian per target pixel: "
+            f"got {means.shape[0]} Gaussians for {height}x{width}."
+        )
+    right = target_c2w[:3, 0]
+    offset = right * float(strength)
+    if perturbation == "lateral_offset":
+        return means + offset
+
+    region = torch.zeros((height, width), dtype=torch.bool, device=means.device)
+    region[height // 4 : 3 * height // 4, width // 4 : 3 * width // 4] = True
+    return means + region.reshape(-1, 1) * offset
+
 # -----------------------------------------------------------------------------
 # 2. Gaussian TTO Optimizer
 # -----------------------------------------------------------------------------
@@ -302,7 +342,8 @@ class GaussianTTOOptimizer(nn.Module):
                  monster_indices: torch.Tensor = None,
                  enable_opacity_baking: bool = False,
                  debug_dir: str = None,
-                 dilation_radius: int = 3,):
+                 dilation_radius: int = 3,
+                 registration_mode: str = "legacy",):
         
         device = target_gaussians.means.device
 
@@ -379,22 +420,42 @@ class GaussianTTOOptimizer(nn.Module):
             cos_theta = torch.clamp(cos_theta, min=0.01)
             init_dists = (aligned_z_depth / cos_theta).unsqueeze(-1)
         
-        opt_dists = init_dists.clone().detach().requires_grad_(True)
+        registration_mode = str(registration_mode or "legacy").lower()
+        if registration_mode not in {"legacy", "ray", "free"}:
+            raise ValueError(
+                f"Unknown registration_mode={registration_mode!r}; "
+                "expected legacy, ray, or free."
+            )
+
+        if registration_mode == "legacy":
+            active_registration_mode = "ray" if using_rc_register else "none"
+        else:
+            active_registration_mode = registration_mode
+
+        opt_dists = init_dists.clone().detach().requires_grad_(active_registration_mode == "ray")
+        opt_means = init_means.clone().detach().requires_grad_(active_registration_mode == "free")
         gt_sparse_depth = target_render_pkg.get('sparse_gt_depth', None).to(device)
         gt_mask = target_render_pkg.get('sparse_valid_mask', None).to(device) > 0.5
         gt_image = target_render_pkg['image'].to(device)
 
-        optimizer_s1 = torch.optim.Adam([opt_dists], lr=0.01) 
+        registration_params = [opt_dists] if active_registration_mode == "ray" else [opt_means]
+        optimizer_s1 = torch.optim.Adam(registration_params, lr=0.01)
 
         with torch.enable_grad():
-            if not using_rc_register:
+            if active_registration_mode == "none":
                 print("ablation study 3: w/o ray-constrained register.")
-                self.steps_stage1 = 0
+                steps_stage1 = 0
+            else:
+                steps_stage1 = self.steps_stage1
+                print(f"  [TTO] Registration mode: {active_registration_mode}")
             start_time = timer_start()
-            for step in range(self.steps_stage1):
+            for step in range(steps_stage1):
                 optimizer_s1.zero_grad()
                 
-                curr_means = cam_center + opt_dists * ray_dirs
+                if active_registration_mode == "ray":
+                    curr_means = cam_center + opt_dists * ray_dirs
+                else:
+                    curr_means = opt_means
                 curr_target_gaussians = self._build_gaussians(curr_means, opt_log_scales, opt_rotations, opt_opacities, opt_harmonics, c2w_rot)
                 merged_gaussians = self.merge_gaussians_for_render(flat_context_gaussians, curr_target_gaussians)
                 
@@ -445,9 +506,14 @@ class GaussianTTOOptimizer(nn.Module):
 
         # import pdb; pdb.set_trace()
         with torch.no_grad():
-            final_means_s1 = cam_center + opt_dists.detach() * ray_dirs 
+            if active_registration_mode == "ray":
+                final_means_s1 = cam_center + opt_dists.detach() * ray_dirs
+            elif active_registration_mode == "free":
+                final_means_s1 = opt_means.detach()
+            else:
+                final_means_s1 = init_means
             target_gaussians.means = final_means_s1.unsqueeze(0).detach()
-            run_eval("Post-Stage1 (Stereo Optimized)", target_gaussians)
+            run_eval(f"Post-Stage1 ({active_registration_mode})", target_gaussians)
 
         # --------------------------------------------------------------------------
         # STAGE 2: Hard Hole Filter (Merged Strategy)
@@ -702,6 +768,9 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
         hole_mask_threshold: float = 0.5,
         dilation_radius: int = 3,
         depth_noise_std: float = 0.0,
+        registration_mode: str = "legacy",
+        registration_perturbation: str = "none",
+        perturbation_strength: float = 0.0,
     ):
         _, _, _, h, w = context["image"].shape
         device = context["image"].device
@@ -841,6 +910,13 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
 
                     # 计算最终的 hole_mask
                     tgt_hole_mask = tgt_opacity_mask < hole_mask_threshold
+                    if registration_perturbation == "silhouette_shift":
+                        tgt_hole_mask = shift_mask_without_wrap(
+                            tgt_hole_mask,
+                            h,
+                            w,
+                            int(round(perturbation_strength)),
+                        )
                     # np.save(cache_path, tgt_hole_mask.cpu().numpy())
                     # print(f"  [Cache Save] Mask saved to {cache_path}")
                     # ================= [Online Get mask: Based on Radii] =================
@@ -937,6 +1013,16 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                 start_time = timer_start()
                 target_gaussians = self._slice_gaussians_views(res_pair["gaussians"], [1])
                 target_gaussians = self._flatten_and_merge_gaussians([target_gaussians], batch_size=1)
+                if registration_perturbation in {"lateral_offset", "object_shift"}:
+                    perturbed_means = apply_position_perturbation(
+                        target_gaussians.means[0],
+                        extra_context["extrinsics"][0, i],
+                        h,
+                        w,
+                        registration_perturbation,
+                        perturbation_strength,
+                    )
+                    target_gaussians.means = perturbed_means.unsqueeze(0)
 
                 ## DEBUG
                 # # save_gaussian_ply(target_gaussians, None, None, "165f5af8bfe32f70595a1c9393a6e442acf7af019998275144f605b89a306557-1.ply")
@@ -1019,6 +1105,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                             stereo_anchor_idx=stereo_anchor_idx,
                             using_rc_register=using_rc_register,
                             using_mv_refinement=using_mv_refinement,
+                            registration_mode=registration_mode,
                             monster_indices=None,
                             enable_opacity_baking=False,
                             debug_dir=debug_dir,
