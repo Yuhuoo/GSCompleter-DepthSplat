@@ -10,17 +10,31 @@ INDEX_PATH="${INDEX_PATH:-assets/evaluation_index_extrapolation/dl3dv/dl3dv_ctx2
 CHECKPOINT="${CHECKPOINT:-pretrained/depthsplat-gs-base-dl3dv-256x448-randview2-6-02c7b19d.pth}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/registration_robustness/dl3dv_ctx2_tgt1_n10}"
 LIMIT="${LIMIT:-20}"
+RESUME="${RESUME:-0}"
 
 # The perturbation units are meters in the normalized scene coordinates for
 # lateral/object shifts, and pixels for silhouette_shift.
 LATERAL_OFFSET="${LATERAL_OFFSET:-0.05}"
 OBJECT_SHIFT="${OBJECT_SHIFT:-0.05}"
-SILHOUETTE_SHIFT="${SILHOUETTE_SHIFT:-12}"
+SILHOUETTE_SHIFT="${SILHOUETTE_SHIFT:-12.0}"
+
+# Hydra parses numeric command-line overrides strictly.  Normalize integer
+# environment values such as SILHOUETTE_SHIFT=12 to a float literal because
+# TestCfg.perturbation_strength is typed as float.
+as_float_literal() {
+  local value="$1"
+  if [[ "$value" == *.* || "$value" == *e* || "$value" == *E* ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s.0' "$value"
+  fi
+}
 
 [[ -d "$DATA_ROOT" ]] || { echo "Missing DATA_ROOT: $DATA_ROOT" >&2; exit 1; }
 [[ -f "$INDEX_PATH" ]] || { echo "Missing INDEX_PATH: $INDEX_PATH" >&2; exit 1; }
 [[ -f "$CHECKPOINT" ]] || { echo "Missing CHECKPOINT: $CHECKPOINT" >&2; exit 1; }
 [[ "$LIMIT" =~ ^[1-9][0-9]*$ ]] || { echo "LIMIT must be positive" >&2; exit 1; }
+[[ "$RESUME" == "0" || "$RESUME" == "1" ]] || { echo "RESUME must be 0 or 1" >&2; exit 1; }
 
 export RUNTIME_LIMIT="$LIMIT"
 unset RUNTIME_WARMUP || true
@@ -31,6 +45,13 @@ run_case() {
   local perturbation="$3"
   local strength="$4"
   local case_output="$OUTPUT_DIR/$case_name"
+  local strength_literal
+  strength_literal="$(as_float_literal "$strength")"
+
+  if [[ "$RESUME" == "1" && -f "$case_output/metrics_summary.txt" ]]; then
+    echo "===== Skipping completed case: $case_name ====="
+    return
+  fi
 
   echo "===== Registration robustness case: $case_name ====="
   mkdir -p "$case_output"
@@ -69,7 +90,7 @@ run_case() {
     test.using_target_align=false \
     "test.registration_mode=$registration_mode" \
     "test.registration_perturbation=$perturbation" \
-    "test.perturbation_strength=$strength" \
+    "test.perturbation_strength=$strength_literal" \
     test.hole_mask_threshold=0.5 \
     test.dilation_radius=3 \
     test.depth_noise_std=0.0 \
