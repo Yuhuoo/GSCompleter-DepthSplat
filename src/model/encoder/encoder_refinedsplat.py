@@ -298,10 +298,11 @@ class GaussianTTOOptimizer(nn.Module):
                 hole_tags: torch.Tensor = None,
                 stereo_anchor_idx: int = None,
                 using_rc_register: bool = False,
-                using_mv_refinement: bool = False,
-                monster_indices: torch.Tensor = None,
-                enable_opacity_baking: bool = False,
-                debug_dir: str = None,):
+                 using_mv_refinement: bool = False,
+                 monster_indices: torch.Tensor = None,
+                 enable_opacity_baking: bool = False,
+                 debug_dir: str = None,
+                 dilation_radius: int = 3,):
         
         device = target_gaussians.means.device
 
@@ -459,7 +460,6 @@ class GaussianTTOOptimizer(nn.Module):
         if use_mask_dilation:
             # --- Strategy A: Hard Hole Filter with Dilation ---
             H, W = target_render_pkg['h'], target_render_pkg['w']
-            dilation_radius = 3 
             hole_mask_2d, dilated_hole_mask, keep_mask = get_dilated_hole_mask(
                 hole_tags, H, W, dilation_radius
             )
@@ -699,6 +699,9 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
         using_mv_refinement: bool = False,
         return_time: bool = False,
         angle_deg: float = 45.0,
+        hole_mask_threshold: float = 0.5,
+        dilation_radius: int = 3,
+        depth_noise_std: float = 0.0,
     ):
         _, _, _, h, w = context["image"].shape
         device = context["image"].device
@@ -837,7 +840,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                         tgt_opacity_mask = tgt_out.alpha[0]
 
                     # 计算最终的 hole_mask
-                    tgt_hole_mask = tgt_opacity_mask < 0.5
+                    tgt_hole_mask = tgt_opacity_mask < hole_mask_threshold
                     # np.save(cache_path, tgt_hole_mask.cpu().numpy())
                     # print(f"  [Cache Save] Mask saved to {cache_path}")
                     # ================= [Online Get mask: Based on Radii] =================
@@ -849,6 +852,14 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
 
                 tgt_valid_mask = ~tgt_hole_mask
                 tgt_sparse_depth = tgt_out.depth[0] * tgt_valid_mask.float()
+                if depth_noise_std > 0.0:
+                    # Relative multiplicative noise models imperfect sparse-depth
+                    # quality while preserving the valid/invalid support.
+                    depth_noise = torch.randn_like(tgt_sparse_depth) * depth_noise_std
+                    noisy_sparse_depth = (tgt_sparse_depth * (1.0 + depth_noise)).clamp_min(1e-4)
+                    tgt_sparse_depth = torch.where(
+                        tgt_valid_mask, noisy_sparse_depth, tgt_sparse_depth
+                    )
 
                 # ---------------- PE-Field Fix ----------------
                 start_time = timer_start()
@@ -1010,7 +1021,8 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                             using_mv_refinement=using_mv_refinement,
                             monster_indices=None,
                             enable_opacity_baking=False,
-                            debug_dir=debug_dir
+                            debug_dir=debug_dir,
+                            dilation_radius=dilation_radius,
                         )
                         runtime["registration"] += self.tto_optimizer.last_timing.get(
                             "registration", 0.0
@@ -1024,6 +1036,7 @@ class EncoderDepthSplatRefiner(EncoderDepthSplat):
                             hole_tags,
                             h,
                             w,
+                            dilation_radius=dilation_radius,
                         )
                         if target_gaussians.means.shape[1] != generated_keep_mask.numel():
                             raise ValueError(

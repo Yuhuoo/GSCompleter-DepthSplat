@@ -83,6 +83,9 @@ class TestCfg:
     using_mv_refinement: bool
     using_target_align: bool
     angle_deg: float
+    hole_mask_threshold: float
+    dilation_radius: int
+    depth_noise_std: float
 
 
 @dataclass
