@@ -94,6 +94,9 @@ test:
   using_mv_refinement: false
   using_target_align: false
   angle_deg: 45.0
+  hole_mask_threshold: 0.5
+  dilation_radius: 3
+  depth_noise_std: 0.0
 
 seed: 111123
 

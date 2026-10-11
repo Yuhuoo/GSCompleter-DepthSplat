@@ -10,27 +10,31 @@ INDEX_PATH="${INDEX_PATH:-assets/evaluation_index_extrapolation/dl3dv/dl3dv_ctx2
 CHECKPOINT="${CHECKPOINT:-pretrained/depthsplat-gs-base-dl3dv-256x448-randview2-6-02c7b19d.pth}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/runtime/dl3dv_ctx2_tgt1_n10}"
 LIMIT="${LIMIT:-}"
+WARMUP="${WARMUP:-5}"
 MODE="${MODE:-both}"
 
 [[ -d "$DATA_ROOT" ]] || { echo "Missing DATA_ROOT: $DATA_ROOT" >&2; exit 1; }
 [[ -f "$INDEX_PATH" ]] || { echo "Missing INDEX_PATH: $INDEX_PATH" >&2; exit 1; }
 [[ -f "$CHECKPOINT" ]] || { echo "Missing CHECKPOINT: $CHECKPOINT" >&2; exit 1; }
+[[ "$WARMUP" =~ ^[0-9]+$ ]] || { echo "WARMUP must be a non-negative integer" >&2; exit 1; }
 
 if [[ -n "$LIMIT" ]]; then
   [[ "$LIMIT" =~ ^[1-9][0-9]*$ ]] || { echo "LIMIT must be a positive integer" >&2; exit 1; }
-  export RUNTIME_LIMIT="$LIMIT"
+  export RUNTIME_LIMIT="$((WARMUP + LIMIT))"
 else
   unset RUNTIME_LIMIT || true
 fi
+export RUNTIME_WARMUP="$WARMUP"
 
 echo "Runtime protocol: DL3DV ctx2-tgt1-n10"
 echo "GPU: $GPU"
 echo "Output root: $OUTPUT_DIR"
 echo "Mode: $MODE"
+echo "Warm-up scenes: $WARMUP (excluded from statistics)"
 if [[ -n "$LIMIT" ]]; then
-  echo "Scene limit: $LIMIT"
+  echo "Measured scene limit: $LIMIT"
 else
-  echo "Scene limit: full test index"
+  echo "Measured scene limit: full test index after warm-up"
 fi
 
 run_case() {

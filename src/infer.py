@@ -222,6 +222,9 @@ def inference(cfg_dict: DictConfig):
     using_mv_refinement = cfg.test.using_mv_refinement
     using_target_align = cfg.test.using_target_align
     angle_deg = cfg.test.angle_deg
+    hole_mask_threshold = cfg.test.hole_mask_threshold
+    dilation_radius = cfg.test.dilation_radius
+    depth_noise_std = cfg.test.depth_noise_std
 
     output_dir = Path(cfg_dict.output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -251,6 +254,7 @@ def inference(cfg_dict: DictConfig):
     time_skip_steps_dict = {"encoder": 0, "decoder": 0}
     runtime_records = []
     runtime_limit = int(os.environ.get("RUNTIME_LIMIT", "-1"))
+    runtime_warmup = max(0, int(os.environ.get("RUNTIME_WARMUP", "0")))
     quiet_runtime = os.environ.get("GS_RUNTIME_QUIET", "0") == "1"
 
     # 3. 加载权重
@@ -288,6 +292,10 @@ def inference(cfg_dict: DictConfig):
             batch[k] = {nk: nv.to(device) if isinstance(nv, torch.Tensor) else nv for nk, nv in batch[k].items()}
 
         (scene,) = batch["scene"]
+        is_warmup = batch_idx < runtime_warmup
+        if batch_idx == runtime_warmup:
+            # Keep auxiliary benchmark output consistent with runtime_summary.json.
+            benchmarker.execution_times.clear()
         pipeline_start = timer_start()
 
 
@@ -332,6 +340,9 @@ def inference(cfg_dict: DictConfig):
                         using_mv_refinement=using_mv_refinement,
                         using_target_align=using_target_align,
                         angle_deg=angle_deg,
+                        hole_mask_threshold=hole_mask_threshold,
+                        dilation_radius=dilation_radius,
+                        depth_noise_std=depth_noise_std,
                     )
         finally:
             if stdout_target is not None:
@@ -444,9 +455,10 @@ def inference(cfg_dict: DictConfig):
 
         if "end_to_end" not in runtime:
             runtime["end_to_end"] = timer_stop(pipeline_start)
-        runtime["scene"] = str(scene)
-        runtime["batch_index"] = int(batch_idx)
-        runtime_records.append(runtime)
+        if not is_warmup:
+            runtime["scene"] = str(scene)
+            runtime["batch_index"] = int(batch_idx)
+            runtime_records.append(runtime)
 
     print(cyan("\nFinalizing Metrics..."))
 
@@ -487,6 +499,8 @@ def inference(cfg_dict: DictConfig):
         "protocol": {
             "description": "Per-scene GPU-synchronized inference time after model loading; excludes file saving, metric computation, and one-time initialization.",
             "runtime_limit": runtime_limit,
+            "warmup_scenes": runtime_warmup,
+            "measured_scene_count": len(runtime_records),
             "includes": [
                 "backbone", "pe_field", "lifting", "depth_alignment",
                 "registration", "refinement", "target_render", "end_to_end",

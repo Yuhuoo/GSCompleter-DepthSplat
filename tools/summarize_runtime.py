@@ -26,6 +26,7 @@ def main() -> None:
 
     data = json.loads(args.input.read_text(encoding="utf-8"))
     print(f"Scenes: {data.get('num_scenes', 0)}")
+    print(f"Warm-up scenes excluded: {data.get('protocol', {}).get('warmup_scenes', 0)}")
     print(f"Runtime file: {args.input}")
     print(f"{'Stage':<20} {'Mean (s)':>12} {'Std (s)':>12} {'Median (s)':>12}")
     print("-" * 62)
