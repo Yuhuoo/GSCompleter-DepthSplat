@@ -13,7 +13,7 @@ CASES="${CASES:-}"
 
 [[ -n "$CASES" ]] || {
   echo "Set CASES='label:scene_id,label:scene_id,...'" >&2
-  echo "Example: CASES='pe_field_failure:<scene>,weak_overlap:<scene>'" >&2
+  echo "Example: CASES='candidate_1:032dee9fb0a8bc1b90871dc5fe950080d0bcd3caf166447f44e60ca50ac04ec7'" >&2
   exit 1
 }
 [[ -d "$DATA_ROOT" ]] || { echo "Missing DATA_ROOT: $DATA_ROOT" >&2; exit 1; }
@@ -26,6 +26,28 @@ for case_spec in "${CASE_LIST[@]}"; do
   scene="${case_spec#*:}"
   [[ -n "$label" && -n "$scene" && "$label" != "$case_spec" ]] || {
     echo "Invalid case specification: $case_spec" >&2
+    exit 1
+  }
+  case "$scene" in
+    "场景ID"|"<scene>"|"<scene_id>"|"scene_id"|"SCENE_ID")
+      echo "Placeholder scene ID '$scene' was provided for case '$label'." >&2
+      echo "Replace it with a real 64-character scene key from: $INDEX_PATH" >&2
+      echo "Example: CASES='pe_field_failure:032dee9fb0a8bc1b90871dc5fe950080d0bcd3caf166447f44e60ca50ac04ec7'" >&2
+      exit 1
+      ;;
+  esac
+  scene_exists="$(python - "$INDEX_PATH" "$scene" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    index = json.load(f)
+print("1" if sys.argv[2] in index else "0")
+PY
+)"
+  [[ "$scene_exists" == "1" ]] || {
+    echo "Scene '$scene' is not present in evaluation index: $INDEX_PATH" >&2
+    echo "Use a scene key from the index JSON (for example, 032dee9f...)." >&2
     exit 1
   }
   case_output="$OUTPUT_DIR/$label/$scene"
