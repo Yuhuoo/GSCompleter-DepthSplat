@@ -60,6 +60,7 @@ class OptimizerCfg:
 class TestCfg:
     output_path: Path
     compute_scores: bool
+    save_scene_metrics: bool
     save_image: bool
     save_video: bool
     eval_time_skip_steps: int

@@ -2,6 +2,7 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import json
+import csv
 import warnings
 import shutil
 import math
@@ -211,6 +212,8 @@ def inference(cfg_dict: DictConfig):
     # 1. 环境与配置
     cfg_dict["mode"] = "test"
     cfg = load_typed_root_config(cfg_dict)
+    if cfg.test.save_scene_metrics and not cfg.test.compute_scores:
+        raise ValueError("test.save_scene_metrics requires test.compute_scores=true")
     set_cfg(cfg_dict)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -254,6 +257,7 @@ def inference(cfg_dict: DictConfig):
     
     # 指标容器
     test_step_outputs = {"psnr": [], "ssim": [], "lpips": []}
+    scene_metric_rows = []
     time_skip_steps_dict = {"encoder": 0, "decoder": 0}
     runtime_records = []
     runtime_limit = int(os.environ.get("RUNTIME_LIMIT", "-1"))
@@ -385,9 +389,22 @@ def inference(cfg_dict: DictConfig):
 
             if cfg.test.compute_scores:
 
-                test_step_outputs["psnr"].append(compute_psnr(rgb_gt, images_prob[0]).mean().item())
-                test_step_outputs["ssim"].append(compute_ssim(rgb_gt, images_prob[0]).mean().item())
-                test_step_outputs["lpips"].append(compute_lpips(rgb_gt, images_prob[0]).mean().item())
+                scene_scores = {
+                    "psnr": compute_psnr(rgb_gt, images_prob[0]).mean().item(),
+                    "ssim": compute_ssim(rgb_gt, images_prob[0]).mean().item(),
+                    "lpips": compute_lpips(rgb_gt, images_prob[0]).mean().item(),
+                }
+                for metric, value in scene_scores.items():
+                    test_step_outputs[metric].append(value)
+                if cfg.test.save_scene_metrics:
+                    target_indices = batch["target"]["index"][0].tolist()
+                    context_indices = batch["context"]["index"][0].tolist()
+                    scene_metric_rows.append({
+                        "scene": str(scene),
+                        "context_indices": ",".join(str(int(index)) for index in context_indices),
+                        "target_indices": ",".join(str(int(index)) for index in target_indices),
+                        **scene_scores,
+                    })
 
                 fake_imgs = torch.clamp(images_prob[0].detach(), 0, 1)
                 real_imgs = torch.clamp(rgb_gt.detach(), 0, 1)
@@ -551,6 +568,14 @@ def inference(cfg_dict: DictConfig):
             f.write(f"{k}: {v:.4f}\n")
 
         f.write(f"Fallback_cnt:{encoder._cnt_fallback}")
+
+    if cfg.test.save_scene_metrics:
+        scene_metrics_path = output_dir / "per_scene_metrics.csv"
+        with scene_metrics_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["scene", "context_indices", "target_indices", "psnr", "ssim", "lpips"])
+            writer.writeheader()
+            writer.writerows(scene_metric_rows)
+        print(cyan(f"Per-scene metrics saved to {scene_metrics_path}"))
 
     backup_dir = output_dir / "backup"
     backup_dir.mkdir(exist_ok=True)
