@@ -1,7 +1,8 @@
 """Paired scene-level statistics from saved target-view PNGs.
 
-Run this from the GSCompleter-DepthSplat repository root. PNG-based metrics
-may differ slightly from metrics computed on floating-point renders.
+The script can be launched without setting ``PYTHONPATH``. Relative data paths
+are resolved against the current working directory. PNG-based metrics may
+differ slightly from metrics computed on floating-point renders.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ import argparse
 import csv
 import json
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -17,6 +19,13 @@ import numpy as np
 import torch
 from PIL import Image
 from scipy.stats import wilcoxon
+
+# Make the repository's top-level ``src`` package importable when this file is
+# launched as ``python tools/analyze_paired_scene_metrics.py``.  In that mode
+# Python puts ``tools/`` on ``sys.path`` rather than the repository root.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from src.evaluation.metrics import compute_lpips, compute_psnr, compute_ssim
 
